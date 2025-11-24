@@ -242,8 +242,8 @@ def load_config():
 print("正在加载配置...")
 CONFIG = load_config()
 print(f"TrendRadar v{VERSION} 配置加载完成")
-print(f"EMAIL_FROM={CONFIG['EMAIL_FROM']}")
-print(f"EMAIL_TO={CONFIG['EMAIL_TO']}")
+print(f"EMAIL_FROM={CONFIG['EMAIL_FROM'].split('')}")
+print(f"EMAIL_TO={CONFIG['EMAIL_TO'].split('')}")
 print(f"监控平台数量: {len(CONFIG['PLATFORMS'])}")
 
 
