@@ -20,6 +20,11 @@ import pytz
 import requests
 import yaml
 from pydantic import BaseModel, Field
+try:
+    from json_repair import repair_json
+except ImportError:
+    print("警告：json-repair 库未安装，将跳过 JSON 修复功能")
+    repair_json = None
 
 
 VERSION = "3.3.0"
@@ -534,7 +539,21 @@ class LLMAnalyzer:
             except json.JSONDecodeError as e:
                 print(f"JSON 解析失败: {e}")
                 print(f"原始内容: {json_content}")
-                return None
+
+                # 尝试使用 json-repair 修复
+                if repair_json is not None:
+                    print("尝试使用 json-repair 修复 JSON...")
+                    try:
+                        repaired_json = repair_json(json_content)
+                        print(f"修复后的 JSON: {repaired_json}")
+                        data = json.loads(repaired_json)
+                        print("JSON 修复成功")
+                    except Exception as repair_error:
+                        print(f"JSON 修复失败: {repair_error}")
+                        return None
+                else:
+                    print("json-repair 库不可用，无法修复 JSON")
+                    return None
 
             # 使用 Pydantic 进行类型验证
             try:
@@ -574,7 +593,7 @@ class LLMAnalyzer:
         return content.rstrip()
 
     def _convert_llm_groups_to_stats(
-        self, validated_groups: List[NewsGroup], data_source: Dict
+        self, validated_groups: List[NewsGroup], deduplicated_data_source: Dict, title_info: Dict
     ) -> List[Dict]:
         """将LLM分析结果转换为stats数据格式"""
         stats = []
@@ -594,9 +613,9 @@ class LLMAnalyzer:
                     else news_title.rank
                 )
 
-                # 从data_source中根据rank查找对应的新闻详细信息
-                news_detail = self._find_news_detail(
-                    rank_value, news_title.source, data_source
+                # 从title_info中查找对应的新闻详细信息（使用去重后的数据）
+                news_detail = self._find_news_detail_from_title_info(
+                    rank_value, news_title.source, deduplicated_data_source, title_info
                 )
 
                 first_time = news_detail.get("first_time", "")
@@ -604,7 +623,7 @@ class LLMAnalyzer:
 
                 # 根据rank查找原始标题
                 original_title = self._find_original_title_by_rank(
-                    rank_value, news_title.source, data_source
+                    rank_value, news_title.source, deduplicated_data_source
                 )
 
                 title_data = {
@@ -644,6 +663,46 @@ class LLMAnalyzer:
             )
 
         return stats
+
+    def _find_news_detail_from_title_info(self, rank: int, source: str, deduplicated_data_source: Dict, title_info: Dict) -> Dict:
+        """从title_info中根据rank和source查找新闻的详细信息（使用去重后的数据）"""
+        # 根据source查找对应的platform_id
+        platform_id = None
+        for platform in CONFIG["PLATFORMS"]:
+            if platform.get("name") == source or platform["id"] == source:
+                platform_id = platform["id"]
+                break
+
+        if not platform_id or platform_id not in deduplicated_data_source:
+            return {}
+
+        # 在去重后的数据中根据rank查找对应的新闻
+        for stored_title, title_data in deduplicated_data_source[platform_id].items():
+            ranks = title_data.get("ranks", [])
+            if rank in ranks:
+                # 从title_info中获取完整的统计信息
+                if (platform_id in title_info and
+                    stored_title in title_info[platform_id]):
+                    info = title_info[platform_id][stored_title]
+                    return {
+                        "first_time": info.get("first_time", ""),
+                        "last_time": info.get("last_time", ""),
+                        "count": info.get("count", len(ranks)),
+                        "url": info.get("url", title_data.get("url", "")),
+                        "mobile_url": info.get("mobileUrl", title_data.get("mobileUrl", "")),
+                        "is_new": False,
+                    }
+                else:
+                    return {
+                        "first_time": "",
+                        "last_time": "",
+                        "count": len(ranks),
+                        "url": title_data.get("url", ""),
+                        "mobile_url": title_data.get("mobileUrl", ""),
+                        "is_new": False,
+                    }
+
+        return {}
 
     def _find_news_detail(self, rank: int, source: str, data_source: Dict) -> Dict:
         """从data_source中根据rank查找新闻的详细信息"""
@@ -731,9 +790,90 @@ class LLMAnalyzer:
             id_to_name[platform_id] = platform_name
         return id_to_name
 
+    def _deduplicate_data_source(self, data_source: Dict) -> Tuple[Dict, Dict]:
+        """对 data_source 进行去重处理，参考 process_source_data 逻辑"""
+        deduplicated_results = {}
+        title_info = {}
+
+        for source_id, titles_data in data_source.items():
+            deduplicated_results[source_id] = {}
+            title_info[source_id] = {}
+
+            for title, data in titles_data.items():
+                ranks = data.get("ranks", [])
+                url = data.get("url", "")
+                mobile_url = data.get("mobileUrl", "")
+
+                # 如果标题不存在，直接添加
+                if title not in deduplicated_results[source_id]:
+                    deduplicated_results[source_id][title] = {
+                        "ranks": ranks,
+                        "url": url,
+                        "mobileUrl": mobile_url,
+                    }
+                    title_info[source_id][title] = {
+                        "first_time": "",
+                        "last_time": "",
+                        "count": len(ranks) if ranks else 1,
+                        "ranks": ranks,
+                        "url": url,
+                        "mobileUrl": mobile_url,
+                    }
+                else:
+                    # 如果标题已存在，合并信息
+                    existing_data = deduplicated_results[source_id][title]
+                    existing_ranks = existing_data.get("ranks", [])
+                    existing_url = existing_data.get("url", "")
+                    existing_mobile_url = existing_data.get("mobileUrl", "")
+
+                    # 合并排名
+                    merged_ranks = existing_ranks.copy()
+                    for rank in ranks:
+                        if rank not in merged_ranks:
+                            merged_ranks.append(rank)
+
+                    # 更新去重结果
+                    deduplicated_results[source_id][title] = {
+                        "ranks": merged_ranks,
+                        "url": existing_url or url,
+                        "mobileUrl": existing_mobile_url or mobile_url,
+                    }
+
+                    # 更新统计信息
+                    title_info[source_id][title]["ranks"] = merged_ranks
+                    title_info[source_id][title]["count"] += len(ranks) if ranks else 1
+                    if not title_info[source_id][title].get("url"):
+                        title_info[source_id][title]["url"] = url
+                    if not title_info[source_id][title].get("mobileUrl"):
+                        title_info[source_id][title]["mobileUrl"] = mobile_url
+
+        return deduplicated_results, title_info
+
     def news_analyze(self, data_source: Dict):
+        # 获取当前监控平台ID列表
+        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
+
+        # 读取完整的历史数据（类似 daily 模式）
+        all_results, id_to_name, title_info = read_all_today_titles(current_platform_ids)
+
+        if not all_results:
+            print("没有找到当天的历史数据，使用当前批次数据")
+            # 如果没有历史数据，回退到原有逻辑
+            deduplicated_data_source, title_info = self._deduplicate_data_source(data_source)
+            original_count = sum(len(titles) for titles in data_source.values())
+            deduplicated_count = sum(len(titles) for titles in deduplicated_data_source.values())
+        else:
+            print(f"读取到历史数据，平台：{list(all_results.keys())}")
+            # 使用历史数据作为基础
+            deduplicated_data_source = all_results
+            original_count = sum(len(titles) for titles in data_source.values())
+            deduplicated_count = sum(len(titles) for titles in deduplicated_data_source.values())
+
+        print(f"LLM处理：当前批次 {original_count} 条，历史数据 {deduplicated_count} 条")
+
+        # 准备LLM分析的新闻标题（使用去重后的数据）
         news_titles: List[Dict[str, str | List[str]]] = []
-        for platform, articles in data_source.items():
+        for platform, articles in deduplicated_data_source.items():
             platform_name = next(
                 (
                     p.get("name", p["id"])
@@ -773,11 +913,11 @@ class LLMAnalyzer:
         else:
             print(f"LLM 分析结果验证成功，共 {len(validated_groups)} 个新闻分组")
 
-        # 将LLM分析结果转换为stats数据
-        stats = self._convert_llm_groups_to_stats(validated_groups, data_source)
+        # 将LLM分析结果转换为stats数据（使用完整的历史数据）
+        stats = self._convert_llm_groups_to_stats(validated_groups, deduplicated_data_source, title_info)
 
         # 生成HTML文件
-        html_file = self._generate_llm_html_report(stats, validated_groups, data_source)
+        html_file = self._generate_llm_html_report(stats, validated_groups, deduplicated_data_source)
 
         return stats, html_file
 
