@@ -1,1887 +1,21 @@
-# coding=utf-8
-
-import json
-import os
-import random
+from typing import List, Dict, Optional
+import requests
+from utils import CONFIG, get_beijing_time, get_output_path
+from utils.config import SMTP_CONFIGS
+from utils.formatter import html_escape, clean_title
+from utils.datetime import format_time_filename
+from utils.statistics import matches_word_groups, format_rank_display
+from pathlib import Path
+from crawler.process import load_frequency_words
 import re
 import time
-import webbrowser
+from .record import PushRecordManager
+
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
 from email.utils import formataddr, formatdate, make_msgid
-from datetime import datetime
-from openai import OpenAI
-from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Union
-
-import pytz
-import requests
-import yaml
-from pydantic import BaseModel, Field
-try:
-    from json_repair import repair_json
-except ImportError:
-    print("警告：json-repair 库未安装，将跳过 JSON 修复功能")
-    repair_json = None
-
-
-VERSION = "3.3.0"
-
-
-# === SMTP邮件配置 ===
-SMTP_CONFIGS = {
-    # Gmail（使用 STARTTLS）
-    "gmail.com": {"server": "smtp.gmail.com", "port": 587, "encryption": "TLS"},
-    # QQ邮箱（使用 SSL，更稳定）
-    "qq.com": {"server": "smtp.qq.com", "port": 465, "encryption": "SSL"},
-    # Outlook（使用 STARTTLS）
-    "outlook.com": {
-        "server": "smtp-mail.outlook.com",
-        "port": 587,
-        "encryption": "TLS",
-    },
-    "hotmail.com": {
-        "server": "smtp-mail.outlook.com",
-        "port": 587,
-        "encryption": "TLS",
-    },
-    "live.com": {"server": "smtp-mail.outlook.com", "port": 587, "encryption": "TLS"},
-    # 网易邮箱（使用 SSL，更稳定）
-    "163.com": {"server": "smtp.163.com", "port": 465, "encryption": "SSL"},
-    "126.com": {"server": "smtp.126.com", "port": 465, "encryption": "SSL"},
-    # 新浪邮箱（使用 SSL）
-    "sina.com": {"server": "smtp.sina.com", "port": 465, "encryption": "SSL"},
-    # 搜狐邮箱（使用 SSL）
-    "sohu.com": {"server": "smtp.sohu.com", "port": 465, "encryption": "SSL"},
-    # 天翼邮箱（使用 SSL）
-    "189.cn": {"server": "smtp.189.cn", "port": 465, "encryption": "SSL"},
-    # 阿里云邮箱（使用 TLS）
-    "aliyun.com": {"server": "smtp.aliyun.com", "port": 465, "encryption": "TLS"},
-}
-
-
-# === 配置管理 ===
-def load_config():
-    """加载配置文件"""
-    config_path = os.environ.get("CONFIG_PATH", "config/config.yaml")
-
-    if not Path(config_path).exists():
-        raise FileNotFoundError(f"配置文件 {config_path} 不存在")
-
-    with open(config_path, "r", encoding="utf-8") as f:
-        config_data = yaml.safe_load(f)
-
-    print(f"配置文件加载成功: {config_path}")
-
-    # 构建配置
-    config = {
-        "VERSION_CHECK_URL": config_data["app"]["version_check_url"],
-        "SHOW_VERSION_UPDATE": config_data["app"]["show_version_update"],
-        "REQUEST_INTERVAL": config_data["crawler"]["request_interval"],
-        "REPORT_MODE": os.environ.get("REPORT_MODE", "").strip()
-        or config_data["report"]["mode"],
-        "RANK_THRESHOLD": config_data["report"]["rank_threshold"],
-        "SORT_BY_POSITION_FIRST": os.environ.get("SORT_BY_POSITION_FIRST", "")
-        .strip()
-        .lower()
-        in ("true", "1")
-        if os.environ.get("SORT_BY_POSITION_FIRST", "").strip()
-        else config_data["report"].get("sort_by_position_first", False),
-        "MAX_NEWS_PER_KEYWORD": int(
-            os.environ.get("MAX_NEWS_PER_KEYWORD", "").strip() or "0"
-        )
-        or config_data["report"].get("max_news_per_keyword", 0),
-        "USE_PROXY": config_data["crawler"]["use_proxy"],
-        "DEFAULT_PROXY": config_data["crawler"]["default_proxy"],
-        "ENABLE_CRAWLER": os.environ.get("ENABLE_CRAWLER", "").strip().lower()
-        in ("true", "1")
-        if os.environ.get("ENABLE_CRAWLER", "").strip()
-        else config_data["crawler"]["enable_crawler"],
-        "ENABLE_NOTIFICATION": os.environ.get("ENABLE_NOTIFICATION", "").strip().lower()
-        in ("true", "1")
-        if os.environ.get("ENABLE_NOTIFICATION", "").strip()
-        else config_data["notification"]["enable_notification"],
-        "MESSAGE_BATCH_SIZE": config_data["notification"]["message_batch_size"],
-        "DINGTALK_BATCH_SIZE": config_data["notification"].get(
-            "dingtalk_batch_size", 20000
-        ),
-        "FEISHU_BATCH_SIZE": config_data["notification"].get(
-            "feishu_batch_size", 29000
-        ),
-        "BARK_BATCH_SIZE": config_data["notification"].get("bark_batch_size", 3600),
-        "BATCH_SEND_INTERVAL": config_data["notification"]["batch_send_interval"],
-        "FEISHU_MESSAGE_SEPARATOR": config_data["notification"][
-            "feishu_message_separator"
-        ],
-        "PUSH_WINDOW": {
-            "ENABLED": os.environ.get("PUSH_WINDOW_ENABLED", "").strip().lower()
-            in ("true", "1")
-            if os.environ.get("PUSH_WINDOW_ENABLED", "").strip()
-            else config_data["notification"]
-            .get("push_window", {})
-            .get("enabled", False),
-            "TIME_RANGE": {
-                "START": os.environ.get("PUSH_WINDOW_START", "").strip()
-                or config_data["notification"]
-                .get("push_window", {})
-                .get("time_range", {})
-                .get("start", "08:00"),
-                "END": os.environ.get("PUSH_WINDOW_END", "").strip()
-                or config_data["notification"]
-                .get("push_window", {})
-                .get("time_range", {})
-                .get("end", "22:00"),
-            },
-            "ONCE_PER_DAY": os.environ.get("PUSH_WINDOW_ONCE_PER_DAY", "")
-            .strip()
-            .lower()
-            in ("true", "1")
-            if os.environ.get("PUSH_WINDOW_ONCE_PER_DAY", "").strip()
-            else config_data["notification"]
-            .get("push_window", {})
-            .get("once_per_day", True),
-            "RECORD_RETENTION_DAYS": int(
-                os.environ.get("PUSH_WINDOW_RETENTION_DAYS", "").strip() or "0"
-            )
-            or config_data["notification"]
-            .get("push_window", {})
-            .get("push_record_retention_days", 7),
-        },
-        "WEIGHT_CONFIG": {
-            "RANK_WEIGHT": config_data["weight"]["rank_weight"],
-            "FREQUENCY_WEIGHT": config_data["weight"]["frequency_weight"],
-            "HOTNESS_WEIGHT": config_data["weight"]["hotness_weight"],
-        },
-        "PLATFORMS": config_data["platforms"],
-        "LLM_KEY": os.environ.get("LLM_KEY", "").strip()
-        or config_data["llm"]["api_key"],
-        "LLM_URL": os.environ.get("LLM_URL", "").strip()
-        or config_data["llm"]["base_url"],
-        "LLM_MODEL": os.environ.get("LLM_MODEL", "").strip()
-        or config_data["llm"]["model"],
-    }
-
-    # 通知渠道配置（环境变量优先）
-    notification = config_data.get("notification", {})
-    webhooks = notification.get("webhooks", {})
-
-    config["FEISHU_WEBHOOK_URL"] = os.environ.get(
-        "FEISHU_WEBHOOK_URL", ""
-    ).strip() or webhooks.get("feishu_url", "")
-    config["DINGTALK_WEBHOOK_URL"] = os.environ.get(
-        "DINGTALK_WEBHOOK_URL", ""
-    ).strip() or webhooks.get("dingtalk_url", "")
-    config["WEWORK_WEBHOOK_URL"] = os.environ.get(
-        "WEWORK_WEBHOOK_URL", ""
-    ).strip() or webhooks.get("wework_url", "")
-    config["WEWORK_MSG_TYPE"] = os.environ.get(
-        "WEWORK_MSG_TYPE", ""
-    ).strip() or webhooks.get("wework_msg_type", "markdown")
-    config["TELEGRAM_BOT_TOKEN"] = os.environ.get(
-        "TELEGRAM_BOT_TOKEN", ""
-    ).strip() or webhooks.get("telegram_bot_token", "")
-    config["TELEGRAM_CHAT_ID"] = os.environ.get(
-        "TELEGRAM_CHAT_ID", ""
-    ).strip() or webhooks.get("telegram_chat_id", "")
-
-    # 邮件配置
-    config["EMAIL_FROM"] = os.environ.get("EMAIL_FROM", "").strip() or webhooks.get(
-        "email_from", ""
-    )
-    config["EMAIL_PASSWORD"] = os.environ.get(
-        "EMAIL_PASSWORD", ""
-    ).strip() or webhooks.get("email_password", "")
-    config["EMAIL_TO"] = os.environ.get("EMAIL_TO", "").strip() or webhooks.get(
-        "email_to", ""
-    )
-    config["EMAIL_SMTP_SERVER"] = os.environ.get(
-        "EMAIL_SMTP_SERVER", ""
-    ).strip() or webhooks.get("email_smtp_server", "")
-    config["EMAIL_SMTP_PORT"] = os.environ.get(
-        "EMAIL_SMTP_PORT", ""
-    ).strip() or webhooks.get("email_smtp_port", "")
-
-    # ntfy配置
-    config["NTFY_SERVER_URL"] = (
-        os.environ.get("NTFY_SERVER_URL", "").strip()
-        or webhooks.get("ntfy_server_url")
-        or "https://ntfy.sh"
-    )
-    config["NTFY_TOPIC"] = os.environ.get("NTFY_TOPIC", "").strip() or webhooks.get(
-        "ntfy_topic", ""
-    )
-    config["NTFY_TOKEN"] = os.environ.get("NTFY_TOKEN", "").strip() or webhooks.get(
-        "ntfy_token", ""
-    )
-
-    # Bark配置
-    config["BARK_URL"] = os.environ.get("BARK_URL", "").strip() or webhooks.get(
-        "bark_url", ""
-    )
-
-    # 输出配置来源信息
-    notification_sources = []
-    if config["FEISHU_WEBHOOK_URL"]:
-        source = "环境变量" if os.environ.get("FEISHU_WEBHOOK_URL") else "配置文件"
-        notification_sources.append(f"飞书({source})")
-    if config["DINGTALK_WEBHOOK_URL"]:
-        source = "环境变量" if os.environ.get("DINGTALK_WEBHOOK_URL") else "配置文件"
-        notification_sources.append(f"钉钉({source})")
-    if config["WEWORK_WEBHOOK_URL"]:
-        source = "环境变量" if os.environ.get("WEWORK_WEBHOOK_URL") else "配置文件"
-        notification_sources.append(f"企业微信({source})")
-    if config["TELEGRAM_BOT_TOKEN"] and config["TELEGRAM_CHAT_ID"]:
-        token_source = (
-            "环境变量" if os.environ.get("TELEGRAM_BOT_TOKEN") else "配置文件"
-        )
-        chat_source = "环境变量" if os.environ.get("TELEGRAM_CHAT_ID") else "配置文件"
-        notification_sources.append(f"Telegram({token_source}/{chat_source})")
-    if config["EMAIL_FROM"] and config["EMAIL_PASSWORD"] and config["EMAIL_TO"]:
-        from_source = "环境变量" if os.environ.get("EMAIL_FROM") else "配置文件"
-        notification_sources.append(f"邮件({from_source})")
-
-    if config["NTFY_SERVER_URL"] and config["NTFY_TOPIC"]:
-        server_source = "环境变量" if os.environ.get("NTFY_SERVER_URL") else "配置文件"
-        notification_sources.append(f"ntfy({server_source})")
-
-    if config["BARK_URL"]:
-        bark_source = "环境变量" if os.environ.get("BARK_URL") else "配置文件"
-        notification_sources.append(f"Bark({bark_source})")
-
-    if notification_sources:
-        print(f"通知渠道配置来源: {', '.join(notification_sources)}")
-    else:
-        print("未配置任何通知渠道")
-
-    return config
-
-
-print("正在加载配置...")
-CONFIG = load_config()
-print(f"TrendRadar v{VERSION} 配置加载完成")
-print(f"监控平台数量: {len(CONFIG['PLATFORMS'])}")
-
-
-# === 工具函数 ===
-def get_beijing_time():
-    """获取北京时间"""
-    return datetime.now(pytz.timezone("Asia/Shanghai"))
-
-
-def format_date_folder():
-    """格式化日期文件夹"""
-    return get_beijing_time().strftime("%Y年%m月%d日")
-
-
-def format_time_filename():
-    """格式化时间文件名"""
-    return get_beijing_time().strftime("%H时%M分")
-
-
-def clean_title(title: str) -> str:
-    """清理标题中的特殊字符"""
-    if not isinstance(title, str):
-        title = str(title)
-    cleaned_title = title.replace("\n", " ").replace("\r", " ")
-    cleaned_title = re.sub(r"\s+", " ", cleaned_title)
-    cleaned_title = cleaned_title.strip()
-    return cleaned_title
-
-
-def ensure_directory_exists(directory: str):
-    """确保目录存在"""
-    Path(directory).mkdir(parents=True, exist_ok=True)
-
-
-def get_output_path(subfolder: str, filename: str) -> str:
-    """获取输出路径"""
-    date_folder = format_date_folder()
-    output_dir = Path("output") / date_folder / subfolder
-    ensure_directory_exists(str(output_dir))
-    return str(output_dir / filename)
-
-
-def check_version_update(
-    current_version: str, version_url: str, proxy_url: Optional[str] = None
-) -> Tuple[bool, Optional[str]]:
-    """检查版本更新"""
-    try:
-        proxies = None
-        if proxy_url:
-            proxies = {"http": proxy_url, "https": proxy_url}
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-            "Accept": "text/plain, */*",
-            "Cache-Control": "no-cache",
-        }
-
-        response = requests.get(
-            version_url, proxies=proxies, headers=headers, timeout=10
-        )
-        response.raise_for_status()
-
-        remote_version = response.text.strip()
-        print(f"当前版本: {current_version}, 远程版本: {remote_version}")
-
-        # 比较版本
-        def parse_version(version_str):
-            try:
-                parts = version_str.strip().split(".")
-                if len(parts) != 3:
-                    raise ValueError("版本号格式不正确")
-                return int(parts[0]), int(parts[1]), int(parts[2])
-            except:
-                return 0, 0, 0
-
-        current_tuple = parse_version(current_version)
-        remote_tuple = parse_version(remote_version)
-
-        need_update = current_tuple < remote_tuple
-        return need_update, remote_version if need_update else None
-
-    except Exception as e:
-        print(f"版本检查失败: {e}")
-        return False, None
-
-
-def is_first_crawl_today() -> bool:
-    """检测是否是当天第一次爬取"""
-    date_folder = format_date_folder()
-    txt_dir = Path("output") / date_folder / "txt"
-
-    if not txt_dir.exists():
-        return True
-
-    files = sorted([f for f in txt_dir.iterdir() if f.suffix == ".txt"])
-    return len(files) <= 1
-
-
-def html_escape(text: str) -> str:
-    """HTML转义"""
-    if not isinstance(text, str):
-        text = str(text)
-
-    return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
-        .replace("'", "&#x27;")
-    )
-
-
-# === 推送记录管理 ===
-class PushRecordManager:
-    """推送记录管理器"""
-
-    def __init__(self):
-        self.record_dir = Path("output") / ".push_records"
-        self.ensure_record_dir()
-        self.cleanup_old_records()
-
-    def ensure_record_dir(self):
-        """确保记录目录存在"""
-        self.record_dir.mkdir(parents=True, exist_ok=True)
-
-    def get_today_record_file(self) -> Path:
-        """获取今天的记录文件路径"""
-        today = get_beijing_time().strftime("%Y%m%d")
-        return self.record_dir / f"push_record_{today}.json"
-
-    def cleanup_old_records(self):
-        """清理过期的推送记录"""
-        retention_days = CONFIG["PUSH_WINDOW"]["RECORD_RETENTION_DAYS"]
-        current_time = get_beijing_time()
-
-        for record_file in self.record_dir.glob("push_record_*.json"):
-            try:
-                date_str = record_file.stem.replace("push_record_", "")
-                file_date = datetime.strptime(date_str, "%Y%m%d")
-                file_date = pytz.timezone("Asia/Shanghai").localize(file_date)
-
-                if (current_time - file_date).days > retention_days:
-                    record_file.unlink()
-                    print(f"清理过期推送记录: {record_file.name}")
-            except Exception as e:
-                print(f"清理记录文件失败 {record_file}: {e}")
-
-    def has_pushed_today(self) -> bool:
-        """检查今天是否已经推送过"""
-        record_file = self.get_today_record_file()
-
-        if not record_file.exists():
-            return False
-
-        try:
-            with open(record_file, "r", encoding="utf-8") as f:
-                record = json.load(f)
-            return record.get("pushed", False)
-        except Exception as e:
-            print(f"读取推送记录失败: {e}")
-            return False
-
-    def record_push(self, report_type: str):
-        """记录推送"""
-        record_file = self.get_today_record_file()
-        now = get_beijing_time()
-
-        record = {
-            "pushed": True,
-            "push_time": now.strftime("%Y-%m-%d %H:%M:%S"),
-            "report_type": report_type,
-        }
-
-        try:
-            with open(record_file, "w", encoding="utf-8") as f:
-                json.dump(record, f, ensure_ascii=False, indent=2)
-            print(f"推送记录已保存: {report_type} at {now.strftime('%H:%M:%S')}")
-        except Exception as e:
-            print(f"保存推送记录失败: {e}")
-
-    def is_in_time_range(self, start_time: str, end_time: str) -> bool:
-        """检查当前时间是否在指定时间范围内"""
-        now = get_beijing_time()
-        current_time = now.strftime("%H:%M")
-
-        def normalize_time(time_str: str) -> str:
-            """将时间字符串标准化为 HH:MM 格式"""
-            try:
-                parts = time_str.strip().split(":")
-                if len(parts) != 2:
-                    raise ValueError(f"时间格式错误: {time_str}")
-
-                hour = int(parts[0])
-                minute = int(parts[1])
-
-                if not (0 <= hour <= 23 and 0 <= minute <= 59):
-                    raise ValueError(f"时间范围错误: {time_str}")
-
-                return f"{hour:02d}:{minute:02d}"
-            except Exception as e:
-                print(f"时间格式化错误 '{time_str}': {e}")
-                return time_str
-
-        normalized_start = normalize_time(start_time)
-        normalized_end = normalize_time(end_time)
-        normalized_current = normalize_time(current_time)
-
-        result = normalized_start <= normalized_current <= normalized_end
-
-        if not result:
-            print(
-                f"时间窗口判断：当前 {normalized_current}，窗口 {normalized_start}-{normalized_end}"
-            )
-
-        return result
-
-
-# === 大模型分析 ===
-# LLM 分析结果的数据模型
-class NewsTitle(BaseModel):
-    rank: Union[int, List[int]]  # 支持单个排名或排名列表
-    source: str
-
-
-class NewsGroup(BaseModel):
-    rank: int = Field(description="按照当前分组的新闻数量和热榜位置给出排名")
-    keywords: List[str] = Field(description="当前分组的新闻关键词，格式为字符串数组")
-    news_title: List[NewsTitle] = Field(description="当前分组的所有新闻标题")
-
-
-class LLMAnalyzer:
-    client: OpenAI
-    system_prompt: str
-
-    def __init__(self) -> None:
-        self.client = OpenAI(
-            api_key=CONFIG["LLM_KEY"],
-            base_url=CONFIG["LLM_URL"],
-        )
-        self.system_prompt = self._load_llm_system_prompt()
-
-    def _load_llm_system_prompt(self) -> str:
-        """加载大模型系统提示词"""
-        prompt_file = os.environ.get(
-            "LLM_SYSTEM_PROMPT_PATH", "config/llm_system_prompt.md"
-        )
-
-        prompt_path = Path(prompt_file)
-        if not prompt_path.exists():
-            raise FileNotFoundError(f"大模型系统提示词文件 {prompt_file} 不存在")
-
-        with open(prompt_path, "r", encoding="utf-8") as f:
-            content = f.read().strip()
-
-        print(f"大模型系统提示词加载成功: {prompt_file}")
-        return content
-
-    def _extract_and_validate_json(
-        self, llm_response: str
-    ) -> Optional[List[NewsGroup]]:
-        """从 LLM 响应中提取 JSON 并进行类型验证"""
-        try:
-            # 使用正则表达式提取 JSON 内容
-            json_pattern = r"```json\s*\n(.*?)\n\s*```"
-            matches = re.findall(json_pattern, llm_response, re.DOTALL)
-
-            if not matches:
-                # 如果没有找到代码块，尝试直接解析整个响应
-                json_content = llm_response.strip()
-            else:
-                json_content = matches[0].strip()
-
-            # 解析 JSON
-            try:
-                data = json.loads(json_content)
-            except json.JSONDecodeError as e:
-                print(f"JSON 解析失败: {e}")
-                print(f"原始内容: {json_content}")
-
-                # 尝试使用 json-repair 修复
-                if repair_json is not None:
-                    print("尝试使用 json-repair 修复 JSON...")
-                    try:
-                        repaired_json = repair_json(json_content)
-                        print(f"修复后的 JSON: {repaired_json}")
-                        data = json.loads(repaired_json)
-                        print("JSON 修复成功")
-                    except Exception as repair_error:
-                        print(f"JSON 修复失败: {repair_error}")
-                        return None
-                else:
-                    print("json-repair 库不可用，无法修复 JSON")
-                    return None
-
-            # 使用 Pydantic 进行类型验证
-            try:
-                news_groups = [NewsGroup(**group) for group in data]
-                print(f"LLM JSON 验证成功，共 {len(news_groups)} 个新闻分组")
-                return news_groups
-            except Exception as e:
-                print(f"Pydantic 类型验证失败: {e}")
-                print(f"解析的数据: {data}")
-                return None
-
-        except Exception as e:
-            print(f"提取 JSON 时发生错误: {e}")
-            return None
-
-    def _prepare_news_title(self, news_title: List[Dict[str, str | List[str]]]) -> str:
-        """将新闻数据转换为大模型可读的 Markdown 格式文本"""
-        if not news_title:
-            return ""
-
-        content = "> 以下是新闻来源及相应的热榜内容和热榜排名\n\n"
-
-        for source_data in news_title:
-            platform_name = source_data.get("platform", "未知来源")
-            articles = source_data.get("articles", [])
-
-            if not articles:
-                continue
-
-            content += f"## {platform_name}\n\n"
-
-            for idx, article in enumerate(articles, 1):
-                content += f"{idx}. {article}\n"
-
-            content += "\n"
-
-        return content.rstrip()
-
-    def _convert_llm_groups_to_stats(
-        self, validated_groups: List[NewsGroup], deduplicated_data_source: Dict, title_info: Dict
-    ) -> List[Dict]:
-        """将LLM分析结果转换为stats数据格式"""
-        stats = []
-        total_titles = sum(len(group.news_title) for group in validated_groups)
-
-        for group in validated_groups:
-            # 构建关键词字符串
-            keywords_str = " ".join(group.keywords)
-
-            # 构建titles数据
-            titles = []
-            for news_title in group.news_title:
-                # 获取rank值（如果是列表取第一个）
-                rank_value = (
-                    news_title.rank[0]
-                    if isinstance(news_title.rank, list)
-                    else news_title.rank
-                )
-
-                # 从title_info中查找对应的新闻详细信息（使用去重后的数据）
-                news_detail = self._find_news_detail_from_title_info(
-                    rank_value, news_title.source, deduplicated_data_source, title_info
-                )
-
-                first_time = news_detail.get("first_time", "")
-                last_time = news_detail.get("last_time", "")
-
-                # 根据rank查找原始标题
-                original_title = self._find_original_title_by_rank(
-                    rank_value, news_title.source, deduplicated_data_source
-                )
-
-                title_data = {
-                    "title": original_title,
-                    "source_name": news_title.source,
-                    "first_time": first_time,
-                    "last_time": last_time,
-                    "time_display": format_time_display(
-                        news_detail.get("first_time", ""),
-                        news_detail.get("last_time", ""),
-                    ),
-                    "count": news_detail.get("count", 1),
-                    "ranks": news_title.rank
-                    if isinstance(news_title.rank, list)
-                    else [news_title.rank],
-                    "rank_threshold": CONFIG["RANK_THRESHOLD"],
-                    "url": news_detail.get("url", ""),
-                    "mobile_url": news_detail.get("mobile_url", ""),
-                    "is_new": news_detail.get("is_new", False),
-                }
-                titles.append(title_data)
-
-            # 计算百分比
-            percentage = (
-                round(len(group.news_title) / total_titles * 100, 2)
-                if total_titles > 0
-                else 0
-            )
-
-            stats.append(
-                {
-                    "word": keywords_str,
-                    "count": len(group.news_title),
-                    "percentage": percentage,
-                    "titles": titles,
-                }
-            )
-
-        return stats
-
-    def _find_news_detail_from_title_info(self, rank: int, source: str, deduplicated_data_source: Dict, title_info: Dict) -> Dict:
-        """从title_info中根据rank和source查找新闻的详细信息（使用去重后的数据）"""
-        # 根据source查找对应的platform_id
-        platform_id = None
-        for platform in CONFIG["PLATFORMS"]:
-            if platform.get("name") == source or platform["id"] == source:
-                platform_id = platform["id"]
-                break
-
-        if not platform_id or platform_id not in deduplicated_data_source:
-            return {}
-
-        # 在去重后的数据中根据rank查找对应的新闻
-        for stored_title, title_data in deduplicated_data_source[platform_id].items():
-            ranks = title_data.get("ranks", [])
-            if rank in ranks:
-                # 从title_info中获取完整的统计信息
-                if (platform_id in title_info and
-                    stored_title in title_info[platform_id]):
-                    info = title_info[platform_id][stored_title]
-                    return {
-                        "first_time": info.get("first_time", ""),
-                        "last_time": info.get("last_time", ""),
-                        "count": info.get("count", len(ranks)),
-                        "url": info.get("url", title_data.get("url", "")),
-                        "mobile_url": info.get("mobileUrl", title_data.get("mobileUrl", "")),
-                        "is_new": False,
-                    }
-                else:
-                    return {
-                        "first_time": "",
-                        "last_time": "",
-                        "count": len(ranks),
-                        "url": title_data.get("url", ""),
-                        "mobile_url": title_data.get("mobileUrl", ""),
-                        "is_new": False,
-                    }
-
-        return {}
-
-    def _find_news_detail(self, rank: int, source: str, data_source: Dict) -> Dict:
-        """从data_source中根据rank查找新闻的详细信息"""
-        # 根据source查找对应的platform_id
-        platform_id = None
-        for platform in CONFIG["PLATFORMS"]:
-            if platform.get("name") == source or platform["id"] == source:
-                platform_id = platform["id"]
-                break
-
-        if not platform_id or platform_id not in data_source:
-            return {}
-
-        # 在该平台的数据中根据rank查找对应的新闻
-        for stored_title, title_data in data_source[platform_id].items():
-            ranks = title_data.get("ranks", [])
-            if rank in ranks:
-                return {
-                    "first_time": "",
-                    "last_time": "",
-                    "count": title_data.get("count", len(ranks)),
-                    "url": title_data.get("url", ""),
-                    "mobile_url": title_data.get("mobileUrl", ""),
-                    "is_new": False,
-                }
-
-        return {}
-
-    def _find_original_title_by_rank(
-        self, rank: int, source: str, data_source: Dict
-    ) -> str:
-        """从data_source中根据rank查找原始新闻标题"""
-        # 根据source查找对应的platform_id
-        platform_id = None
-        for platform in CONFIG["PLATFORMS"]:
-            if platform.get("name") == source or platform["id"] == source:
-                platform_id = platform["id"]
-                break
-
-        if not platform_id or platform_id not in data_source:
-            return ""
-
-        # 在该平台的数据中根据rank查找对应的原始标题
-        for stored_title, title_data in data_source[platform_id].items():
-            ranks = title_data.get("ranks", [])
-            if rank in ranks:
-                return stored_title
-
-        return ""
-
-    def _generate_llm_html_report(
-        self, stats: List[Dict], validated_groups: List[NewsGroup], data_source: Dict
-    ) -> str:
-        """生成基于LLM分析结果的HTML报告"""
-        total_titles = sum(len(group.news_title) for group in validated_groups)
-
-        # 构建report_data
-        report_data = {
-            "stats": stats,
-            "new_titles": [],  # LLM分析模式下暂不处理新增新闻
-            "failed_ids": [],
-            "total_new_count": 0,
-        }
-
-        # 生成HTML文件
-        html_file = generate_html_report(
-            stats=stats,
-            total_titles=total_titles,
-            failed_ids=[],
-            new_titles=None,
-            id_to_name=self._build_id_to_name_mapping(data_source),
-            mode="llm_analysis",
-            is_daily_summary=False,
-            update_info=None,
-        )
-
-        return html_file
-
-    def _build_id_to_name_mapping(self, data_source: Dict) -> Dict:
-        """构建platform_id到name的映射"""
-        id_to_name = {}
-        for platform in CONFIG["PLATFORMS"]:
-            platform_id = platform["id"]
-            platform_name = platform.get("name", platform_id)
-            id_to_name[platform_id] = platform_name
-        return id_to_name
-
-    def _deduplicate_data_source(self, data_source: Dict) -> Tuple[Dict, Dict]:
-        """对 data_source 进行去重处理，参考 process_source_data 逻辑"""
-        deduplicated_results = {}
-        title_info = {}
-
-        for source_id, titles_data in data_source.items():
-            deduplicated_results[source_id] = {}
-            title_info[source_id] = {}
-
-            for title, data in titles_data.items():
-                ranks = data.get("ranks", [])
-                url = data.get("url", "")
-                mobile_url = data.get("mobileUrl", "")
-
-                # 如果标题不存在，直接添加
-                if title not in deduplicated_results[source_id]:
-                    deduplicated_results[source_id][title] = {
-                        "ranks": ranks,
-                        "url": url,
-                        "mobileUrl": mobile_url,
-                    }
-                    title_info[source_id][title] = {
-                        "first_time": "",
-                        "last_time": "",
-                        "count": len(ranks) if ranks else 1,
-                        "ranks": ranks,
-                        "url": url,
-                        "mobileUrl": mobile_url,
-                    }
-                else:
-                    # 如果标题已存在，合并信息
-                    existing_data = deduplicated_results[source_id][title]
-                    existing_ranks = existing_data.get("ranks", [])
-                    existing_url = existing_data.get("url", "")
-                    existing_mobile_url = existing_data.get("mobileUrl", "")
-
-                    # 合并排名
-                    merged_ranks = existing_ranks.copy()
-                    for rank in ranks:
-                        if rank not in merged_ranks:
-                            merged_ranks.append(rank)
-
-                    # 更新去重结果
-                    deduplicated_results[source_id][title] = {
-                        "ranks": merged_ranks,
-                        "url": existing_url or url,
-                        "mobileUrl": existing_mobile_url or mobile_url,
-                    }
-
-                    # 更新统计信息
-                    title_info[source_id][title]["ranks"] = merged_ranks
-                    title_info[source_id][title]["count"] += len(ranks) if ranks else 1
-                    if not title_info[source_id][title].get("url"):
-                        title_info[source_id][title]["url"] = url
-                    if not title_info[source_id][title].get("mobileUrl"):
-                        title_info[source_id][title]["mobileUrl"] = mobile_url
-
-        return deduplicated_results, title_info
-
-    def news_analyze(self, data_source: Dict):
-        # 获取当前监控平台ID列表
-        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
-
-        # 读取完整的历史数据（类似 daily 模式）
-        all_results, id_to_name, title_info = read_all_today_titles(current_platform_ids)
-
-        if not all_results:
-            print("没有找到当天的历史数据，使用当前批次数据")
-            # 如果没有历史数据，回退到原有逻辑
-            deduplicated_data_source, title_info = self._deduplicate_data_source(data_source)
-            original_count = sum(len(titles) for titles in data_source.values())
-            deduplicated_count = sum(len(titles) for titles in deduplicated_data_source.values())
-        else:
-            print(f"读取到历史数据，平台：{list(all_results.keys())}")
-            # 使用历史数据作为基础
-            deduplicated_data_source = all_results
-            original_count = sum(len(titles) for titles in data_source.values())
-            deduplicated_count = sum(len(titles) for titles in deduplicated_data_source.values())
-
-        print(f"LLM处理：当前批次 {original_count} 条，历史数据 {deduplicated_count} 条")
-
-        # 准备LLM分析的新闻标题（使用去重后的数据）
-        news_titles: List[Dict[str, str | List[str]]] = []
-        for platform, articles in deduplicated_data_source.items():
-            platform_name = next(
-                (
-                    p.get("name", p["id"])
-                    for p in CONFIG["PLATFORMS"]
-                    if p["id"] == platform
-                ),
-                platform,
-            )
-            news_titles.append(
-                {
-                    "platform": platform_name,
-                    "articles": list(articles.keys()),
-                }
-            )
-
-        print(f"LLM 分析中，模型：{CONFIG['LLM_MODEL']}")
-        response = self.client.chat.completions.create(
-            model=CONFIG["LLM_MODEL"],
-            messages=[
-                {"role": "system", "content": self.system_prompt},
-                {"role": "user", "content": self._prepare_news_title(news_titles)},
-            ],
-            stream=False,
-        )
-
-        llm_summary = response.choices[0].message.content
-        print("LLM 分析完成")
-
-        if llm_summary is None:
-            print("LLM 返回的结果为空")
-            return None
-        # 提取并验证 JSON 格式
-        validated_groups = self._extract_and_validate_json(llm_summary)
-        if validated_groups is None:
-            print("LLM 分析结果格式验证失败，跳过此步骤")
-            return None
-        else:
-            print(f"LLM 分析结果验证成功，共 {len(validated_groups)} 个新闻分组")
-
-        # 将LLM分析结果转换为stats数据（使用完整的历史数据）
-        stats = self._convert_llm_groups_to_stats(validated_groups, deduplicated_data_source, title_info)
-
-        # 生成HTML文件
-        html_file = self._generate_llm_html_report(stats, validated_groups, deduplicated_data_source)
-
-        return stats, html_file
-
-
-# === 数据获取 ===
-class DataFetcher:
-    """数据获取器"""
-
-    def __init__(self, proxy_url: Optional[str] = None):
-        self.proxy_url = proxy_url
-
-    def fetch_data(
-        self,
-        id_info: Union[str, Tuple[str, str]],
-        max_retries: int = 2,
-        min_retry_wait: int = 3,
-        max_retry_wait: int = 5,
-    ) -> Tuple[Optional[str], str, str]:
-        """获取指定ID数据，支持重试"""
-        if isinstance(id_info, tuple):
-            id_value, alias = id_info
-        else:
-            id_value = id_info
-            alias = id_value
-
-        url = f"https://newsnow.busiyi.world/api/s?id={id_value}&latest"
-
-        proxies = None
-        if self.proxy_url:
-            proxies = {"http": self.proxy_url, "https": self.proxy_url}
-
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            "Accept": "application/json, text/plain, */*",
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Connection": "keep-alive",
-            "Cache-Control": "no-cache",
-        }
-
-        retries = 0
-        while retries <= max_retries:
-            try:
-                response = requests.get(
-                    url, proxies=proxies, headers=headers, timeout=10
-                )
-                response.raise_for_status()
-
-                data_text = response.text
-
-                data_json = json.loads(data_text)
-
-                status = data_json.get("status", "未知")
-                if status not in ["success", "cache"]:
-                    raise ValueError(f"响应状态异常: {status}")
-
-                status_info = "最新数据" if status == "success" else "缓存数据"
-                print(f"获取 {id_value} 成功（{status_info}）")
-                return data_text, id_value, alias
-
-            except Exception as e:
-                retries += 1
-                if retries <= max_retries:
-                    base_wait = random.uniform(min_retry_wait, max_retry_wait)
-                    additional_wait = (retries - 1) * random.uniform(1, 2)
-                    wait_time = base_wait + additional_wait
-                    print(f"请求 {id_value} 失败: {e}. {wait_time:.2f}秒后重试...")
-                    time.sleep(wait_time)
-                else:
-                    print(f"请求 {id_value} 失败: {e}")
-                    return None, id_value, alias
-        return None, id_value, alias
-
-    def crawl_websites(
-        self,
-        ids_list: List[Union[str, Tuple[str, str]]],
-        request_interval: int = CONFIG["REQUEST_INTERVAL"],
-    ) -> Tuple[Dict, Dict, List]:
-        """爬取多个网站数据"""
-        results = {}
-        id_to_name = {}
-        failed_ids = []
-
-        for i, id_info in enumerate(ids_list):
-            if isinstance(id_info, tuple):
-                id_value, name = id_info
-            else:
-                id_value = id_info
-                name = id_value
-
-            id_to_name[id_value] = name
-            response, _, _ = self.fetch_data(id_info)
-
-            if response:
-                try:
-                    data = json.loads(response)
-                    results[id_value] = {}
-                    for index, item in enumerate(data.get("items", []), 1):
-                        title = item.get("title")
-                        # 跳过无效标题（None、float、空字符串）
-                        if (
-                            title is None
-                            or isinstance(title, float)
-                            or not str(title).strip()
-                        ):
-                            continue
-                        title = str(title).strip()
-                        url = item.get("url", "")
-                        mobile_url = item.get("mobileUrl", "")
-
-                        if title in results[id_value]:
-                            results[id_value][title]["ranks"].append(index)
-                        else:
-                            results[id_value][title] = {
-                                "ranks": [index],
-                                "url": url,
-                                "mobileUrl": mobile_url,
-                            }
-                except json.JSONDecodeError:
-                    print(f"解析 {id_value} 响应失败")
-                    failed_ids.append(id_value)
-                except Exception as e:
-                    print(f"处理 {id_value} 数据出错: {e}")
-                    failed_ids.append(id_value)
-            else:
-                failed_ids.append(id_value)
-
-            if i < len(ids_list) - 1:
-                actual_interval = request_interval + random.randint(-10, 20)
-                actual_interval = max(50, actual_interval)
-                time.sleep(actual_interval / 1000)
-
-        print(f"成功: {list(results.keys())}, 失败: {failed_ids}")
-        return results, id_to_name, failed_ids
-
-
-# === 数据处理 ===
-def save_titles_to_file(results: Dict, id_to_name: Dict, failed_ids: List) -> str:
-    """保存标题到文件"""
-    file_path = get_output_path("txt", f"{format_time_filename()}.txt")
-
-    with open(file_path, "w", encoding="utf-8") as f:
-        for id_value, title_data in results.items():
-            # id | name 或 id
-            name = id_to_name.get(id_value)
-            if name and name != id_value:
-                f.write(f"{id_value} | {name}\n")
-            else:
-                f.write(f"{id_value}\n")
-
-            # 按排名排序标题
-            sorted_titles = []
-            for title, info in title_data.items():
-                cleaned_title = clean_title(title)
-                if isinstance(info, dict):
-                    ranks = info.get("ranks", [])
-                    url = info.get("url", "")
-                    mobile_url = info.get("mobileUrl", "")
-                else:
-                    ranks = info if isinstance(info, list) else []
-                    url = ""
-                    mobile_url = ""
-
-                rank = ranks[0] if ranks else 1
-                sorted_titles.append((rank, cleaned_title, url, mobile_url))
-
-            sorted_titles.sort(key=lambda x: x[0])
-
-            for rank, cleaned_title, url, mobile_url in sorted_titles:
-                line = f"{rank}. {cleaned_title}"
-
-                if url:
-                    line += f" [URL:{url}]"
-                if mobile_url:
-                    line += f" [MOBILE:{mobile_url}]"
-                f.write(line + "\n")
-
-            f.write("\n")
-
-        if failed_ids:
-            f.write("==== 以下ID请求失败 ====\n")
-            for id_value in failed_ids:
-                f.write(f"{id_value}\n")
-
-    return file_path
-
-
-def load_frequency_words(
-    frequency_file: Optional[str] = None,
-) -> Tuple[List[Dict], List[str]]:
-    """加载频率词配置"""
-    if frequency_file is None:
-        frequency_file = os.environ.get(
-            "FREQUENCY_WORDS_PATH", "config/frequency_words.txt"
-        )
-
-    frequency_path = Path(frequency_file)
-    if not frequency_path.exists():
-        raise FileNotFoundError(f"频率词文件 {frequency_file} 不存在")
-
-    with open(frequency_path, "r", encoding="utf-8") as f:
-        content = f.read()
-
-    word_groups = [group.strip() for group in content.split("\n\n") if group.strip()]
-
-    processed_groups = []
-    filter_words = []
-
-    for group in word_groups:
-        words = [word.strip() for word in group.split("\n") if word.strip()]
-
-        group_required_words = []
-        group_normal_words = []
-        group_filter_words = []
-        group_max_count = 0  # 默认不限制
-
-        for word in words:
-            if word.startswith("@"):
-                # 解析最大显示数量（只接受正整数）
-                try:
-                    count = int(word[1:])
-                    if count > 0:
-                        group_max_count = count
-                except (ValueError, IndexError):
-                    pass  # 忽略无效的@数字格式
-            elif word.startswith("!"):
-                filter_words.append(word[1:])
-                group_filter_words.append(word[1:])
-            elif word.startswith("+"):
-                group_required_words.append(word[1:])
-            else:
-                group_normal_words.append(word)
-
-        if group_required_words or group_normal_words:
-            if group_normal_words:
-                group_key = " ".join(group_normal_words)
-            else:
-                group_key = " ".join(group_required_words)
-
-            processed_groups.append(
-                {
-                    "required": group_required_words,
-                    "normal": group_normal_words,
-                    "group_key": group_key,
-                    "max_count": group_max_count,  # 新增字段
-                }
-            )
-
-    return processed_groups, filter_words
-
-
-def parse_file_titles(file_path: Path) -> Tuple[Dict, Dict]:
-    """解析单个txt文件的标题数据，返回(titles_by_id, id_to_name)"""
-    titles_by_id = {}
-    id_to_name = {}
-
-    with open(file_path, "r", encoding="utf-8") as f:
-        content = f.read()
-        sections = content.split("\n\n")
-
-        for section in sections:
-            if not section.strip() or "==== 以下ID请求失败 ====" in section:
-                continue
-
-            lines = section.strip().split("\n")
-            if len(lines) < 2:
-                continue
-
-            # id | name 或 id
-            header_line = lines[0].strip()
-            if " | " in header_line:
-                parts = header_line.split(" | ", 1)
-                source_id = parts[0].strip()
-                name = parts[1].strip()
-                id_to_name[source_id] = name
-            else:
-                source_id = header_line
-                id_to_name[source_id] = source_id
-
-            titles_by_id[source_id] = {}
-
-            for line in lines[1:]:
-                if line.strip():
-                    try:
-                        title_part = line.strip()
-                        rank = None
-
-                        # 提取排名
-                        if ". " in title_part and title_part.split(". ")[0].isdigit():
-                            rank_str, title_part = title_part.split(". ", 1)
-                            rank = int(rank_str)
-
-                        # 提取 MOBILE URL
-                        mobile_url = ""
-                        if " [MOBILE:" in title_part:
-                            title_part, mobile_part = title_part.rsplit(" [MOBILE:", 1)
-                            if mobile_part.endswith("]"):
-                                mobile_url = mobile_part[:-1]
-
-                        # 提取 URL
-                        url = ""
-                        if " [URL:" in title_part:
-                            title_part, url_part = title_part.rsplit(" [URL:", 1)
-                            if url_part.endswith("]"):
-                                url = url_part[:-1]
-
-                        title = clean_title(title_part.strip())
-                        ranks = [rank] if rank is not None else [1]
-
-                        titles_by_id[source_id][title] = {
-                            "ranks": ranks,
-                            "url": url,
-                            "mobileUrl": mobile_url,
-                        }
-
-                    except Exception as e:
-                        print(f"解析标题行出错: {line}, 错误: {e}")
-
-    return titles_by_id, id_to_name
-
-
-def read_all_today_titles(
-    current_platform_ids: Optional[List[str]] = None,
-) -> Tuple[Dict, Dict, Dict]:
-    """读取当天所有标题文件，支持按当前监控平台过滤"""
-    date_folder = format_date_folder()
-    txt_dir = Path("output") / date_folder / "txt"
-
-    if not txt_dir.exists():
-        return {}, {}, {}
-
-    all_results = {}
-    final_id_to_name = {}
-    title_info = {}
-
-    files = sorted([f for f in txt_dir.iterdir() if f.suffix == ".txt"])
-
-    for file_path in files:
-        time_info = file_path.stem
-
-        titles_by_id, file_id_to_name = parse_file_titles(file_path)
-
-        if current_platform_ids is not None:
-            filtered_titles_by_id = {}
-            filtered_id_to_name = {}
-
-            for source_id, title_data in titles_by_id.items():
-                if source_id in current_platform_ids:
-                    filtered_titles_by_id[source_id] = title_data
-                    if source_id in file_id_to_name:
-                        filtered_id_to_name[source_id] = file_id_to_name[source_id]
-
-            titles_by_id = filtered_titles_by_id
-            file_id_to_name = filtered_id_to_name
-
-        final_id_to_name.update(file_id_to_name)
-
-        for source_id, title_data in titles_by_id.items():
-            process_source_data(
-                source_id, title_data, time_info, all_results, title_info
-            )
-
-    return all_results, final_id_to_name, title_info
-
-
-def process_source_data(
-    source_id: str,
-    title_data: Dict,
-    time_info: str,
-    all_results: Dict,
-    title_info: Dict,
-) -> None:
-    """处理来源数据，合并重复标题"""
-    if source_id not in all_results:
-        all_results[source_id] = title_data
-
-        if source_id not in title_info:
-            title_info[source_id] = {}
-
-        for title, data in title_data.items():
-            ranks = data.get("ranks", [])
-            url = data.get("url", "")
-            mobile_url = data.get("mobileUrl", "")
-
-            title_info[source_id][title] = {
-                "first_time": time_info,
-                "last_time": time_info,
-                "count": 1,
-                "ranks": ranks,
-                "url": url,
-                "mobileUrl": mobile_url,
-            }
-    else:
-        for title, data in title_data.items():
-            ranks = data.get("ranks", [])
-            url = data.get("url", "")
-            mobile_url = data.get("mobileUrl", "")
-
-            if title not in all_results[source_id]:
-                all_results[source_id][title] = {
-                    "ranks": ranks,
-                    "url": url,
-                    "mobileUrl": mobile_url,
-                }
-                title_info[source_id][title] = {
-                    "first_time": time_info,
-                    "last_time": time_info,
-                    "count": 1,
-                    "ranks": ranks,
-                    "url": url,
-                    "mobileUrl": mobile_url,
-                }
-            else:
-                existing_data = all_results[source_id][title]
-                existing_ranks = existing_data.get("ranks", [])
-                existing_url = existing_data.get("url", "")
-                existing_mobile_url = existing_data.get("mobileUrl", "")
-
-                merged_ranks = existing_ranks.copy()
-                for rank in ranks:
-                    if rank not in merged_ranks:
-                        merged_ranks.append(rank)
-
-                all_results[source_id][title] = {
-                    "ranks": merged_ranks,
-                    "url": existing_url or url,
-                    "mobileUrl": existing_mobile_url or mobile_url,
-                }
-
-                title_info[source_id][title]["last_time"] = time_info
-                title_info[source_id][title]["ranks"] = merged_ranks
-                title_info[source_id][title]["count"] += 1
-                if not title_info[source_id][title].get("url"):
-                    title_info[source_id][title]["url"] = url
-                if not title_info[source_id][title].get("mobileUrl"):
-                    title_info[source_id][title]["mobileUrl"] = mobile_url
-
-
-def detect_latest_new_titles(current_platform_ids: Optional[List[str]] = None) -> Dict:
-    """检测当日最新批次的新增标题，支持按当前监控平台过滤"""
-    date_folder = format_date_folder()
-    txt_dir = Path("output") / date_folder / "txt"
-
-    if not txt_dir.exists():
-        return {}
-
-    files = sorted([f for f in txt_dir.iterdir() if f.suffix == ".txt"])
-    if len(files) < 2:
-        return {}
-
-    # 解析最新文件
-    latest_file = files[-1]
-    latest_titles, _ = parse_file_titles(latest_file)
-
-    # 如果指定了当前平台列表，过滤最新文件数据
-    if current_platform_ids is not None:
-        filtered_latest_titles = {}
-        for source_id, title_data in latest_titles.items():
-            if source_id in current_platform_ids:
-                filtered_latest_titles[source_id] = title_data
-        latest_titles = filtered_latest_titles
-
-    # 汇总历史标题（按平台过滤）
-    historical_titles = {}
-    for file_path in files[:-1]:
-        historical_data, _ = parse_file_titles(file_path)
-
-        # 过滤历史数据
-        if current_platform_ids is not None:
-            filtered_historical_data = {}
-            for source_id, title_data in historical_data.items():
-                if source_id in current_platform_ids:
-                    filtered_historical_data[source_id] = title_data
-            historical_data = filtered_historical_data
-
-        for source_id, titles_data in historical_data.items():
-            if source_id not in historical_titles:
-                historical_titles[source_id] = set()
-            for title in titles_data.keys():
-                historical_titles[source_id].add(title)
-
-    # 找出新增标题
-    new_titles = {}
-    for source_id, latest_source_titles in latest_titles.items():
-        historical_set = historical_titles.get(source_id, set())
-        source_new_titles = {}
-
-        for title, title_data in latest_source_titles.items():
-            if title not in historical_set:
-                source_new_titles[title] = title_data
-
-        if source_new_titles:
-            new_titles[source_id] = source_new_titles
-
-    return new_titles
-
-
-# === 统计和分析 ===
-def calculate_news_weight(
-    title_data: Dict, rank_threshold: int = CONFIG["RANK_THRESHOLD"]
-) -> float:
-    """计算新闻权重，用于排序"""
-    ranks = title_data.get("ranks", [])
-    if not ranks:
-        return 0.0
-
-    count = title_data.get("count", len(ranks))
-    weight_config = CONFIG["WEIGHT_CONFIG"]
-
-    # 排名权重：Σ(11 - min(rank, 10)) / 出现次数
-    rank_scores = []
-    for rank in ranks:
-        score = 11 - min(rank, 10)
-        rank_scores.append(score)
-
-    rank_weight = sum(rank_scores) / len(ranks) if ranks else 0
-
-    # 频次权重：min(出现次数, 10) × 10
-    frequency_weight = min(count, 10) * 10
-
-    # 热度加成：高排名次数 / 总出现次数 × 100
-    high_rank_count = sum(1 for rank in ranks if rank <= rank_threshold)
-    hotness_ratio = high_rank_count / len(ranks) if ranks else 0
-    hotness_weight = hotness_ratio * 100
-
-    total_weight = (
-        rank_weight * weight_config["RANK_WEIGHT"]
-        + frequency_weight * weight_config["FREQUENCY_WEIGHT"]
-        + hotness_weight * weight_config["HOTNESS_WEIGHT"]
-    )
-
-    return total_weight
-
-
-def matches_word_groups(
-    title: str, word_groups: List[Dict], filter_words: List[str]
-) -> bool:
-    """检查标题是否匹配词组规则"""
-    # 防御性类型检查：确保 title 是有效字符串
-    if not isinstance(title, str):
-        title = str(title) if title is not None else ""
-    if not title.strip():
-        return False
-
-    # 如果没有配置词组，则匹配所有标题（支持显示全部新闻）
-    if not word_groups:
-        return True
-
-    title_lower = title.lower()
-
-    # 过滤词检查
-    if any(filter_word.lower() in title_lower for filter_word in filter_words):
-        return False
-
-    # 词组匹配检查
-    for group in word_groups:
-        required_words = group["required"]
-        normal_words = group["normal"]
-
-        # 必须词检查
-        if required_words:
-            all_required_present = all(
-                req_word.lower() in title_lower for req_word in required_words
-            )
-            if not all_required_present:
-                continue
-
-        # 普通词检查
-        if normal_words:
-            any_normal_present = any(
-                normal_word.lower() in title_lower for normal_word in normal_words
-            )
-            if not any_normal_present:
-                continue
-
-        return True
-
-    return False
-
-
-def format_time_display(first_time: str, last_time: str) -> str:
-    """格式化时间显示"""
-    if not first_time:
-        return ""
-    if first_time == last_time or not last_time:
-        return first_time
-    else:
-        return f"[{first_time} ~ {last_time}]"
-
-
-def format_rank_display(ranks: List[int], rank_threshold: int, format_type: str) -> str:
-    """统一的排名格式化方法"""
-    if not ranks:
-        return ""
-
-    unique_ranks = sorted(set(ranks))
-    min_rank = unique_ranks[0]
-    max_rank = unique_ranks[-1]
-
-    if format_type == "html":
-        highlight_start = "<font color='red'><strong>"
-        highlight_end = "</strong></font>"
-    elif format_type == "feishu":
-        highlight_start = "<font color='red'>**"
-        highlight_end = "**</font>"
-    elif format_type == "dingtalk":
-        highlight_start = "**"
-        highlight_end = "**"
-    elif format_type == "wework":
-        highlight_start = "**"
-        highlight_end = "**"
-    elif format_type == "telegram":
-        highlight_start = "<b>"
-        highlight_end = "</b>"
-    else:
-        highlight_start = "**"
-        highlight_end = "**"
-
-    if min_rank <= rank_threshold:
-        if min_rank == max_rank:
-            return f"{highlight_start}[{min_rank}]{highlight_end}"
-        else:
-            return f"{highlight_start}[{min_rank} - {max_rank}]{highlight_end}"
-    else:
-        if min_rank == max_rank:
-            return f"[{min_rank}]"
-        else:
-            return f"[{min_rank} - {max_rank}]"
-
-
-def count_word_frequency(
-    results: Dict,
-    word_groups: List[Dict],
-    filter_words: List[str],
-    id_to_name: Dict,
-    title_info: Optional[Dict] = None,
-    rank_threshold: int = CONFIG["RANK_THRESHOLD"],
-    new_titles: Optional[Dict] = None,
-    mode: str = "daily",
-) -> Tuple[List[Dict], int]:
-    """统计词频，支持必须词、频率词、过滤词，并标记新增标题"""
-
-    # 如果没有配置词组，创建一个包含所有新闻的虚拟词组
-    if not word_groups:
-        print("频率词配置为空，将显示所有新闻")
-        word_groups = [{"required": [], "normal": [], "group_key": "全部新闻"}]
-        filter_words = []  # 清空过滤词，显示所有新闻
-
-    is_first_today = is_first_crawl_today()
-
-    # 确定处理的数据源和新增标记逻辑
-    if mode == "incremental":
-        if is_first_today:
-            # 增量模式 + 当天第一次：处理所有新闻，都标记为新增
-            results_to_process = results
-            all_news_are_new = True
-        else:
-            # 增量模式 + 当天非第一次：只处理新增的新闻
-            results_to_process = new_titles if new_titles else {}
-            all_news_are_new = True
-    elif mode == "current":
-        # current 模式：只处理当前时间批次的新闻，但统计信息来自全部历史
-        if title_info:
-            latest_time = None
-            for source_titles in title_info.values():
-                for title_data in source_titles.values():
-                    last_time = title_data.get("last_time", "")
-                    if last_time:
-                        if latest_time is None or last_time > latest_time:
-                            latest_time = last_time
-
-            # 只处理 last_time 等于最新时间的新闻
-            if latest_time:
-                results_to_process = {}
-                for source_id, source_titles in results.items():
-                    if source_id in title_info:
-                        filtered_titles = {}
-                        for title, title_data in source_titles.items():
-                            if title in title_info[source_id]:
-                                info = title_info[source_id][title]
-                                if info.get("last_time") == latest_time:
-                                    filtered_titles[title] = title_data
-                        if filtered_titles:
-                            results_to_process[source_id] = filtered_titles
-
-                print(
-                    f"当前榜单模式：最新时间 {latest_time}，筛选出 {sum(len(titles) for titles in results_to_process.values())} 条当前榜单新闻"
-                )
-            else:
-                results_to_process = results
-        else:
-            results_to_process = results
-        all_news_are_new = False
-    else:
-        # 当日汇总模式：处理所有新闻
-        results_to_process = results
-        all_news_are_new = False
-        total_input_news = sum(len(titles) for titles in results.values())
-        filter_status = (
-            "全部显示"
-            if len(word_groups) == 1 and word_groups[0]["group_key"] == "全部新闻"
-            else "频率词过滤"
-        )
-        print(f"当日汇总模式：处理 {total_input_news} 条新闻，模式：{filter_status}")
-
-    word_stats = {}
-    total_titles = 0
-    processed_titles = {}
-    matched_new_count = 0
-
-    if title_info is None:
-        title_info = {}
-    if new_titles is None:
-        new_titles = {}
-
-    for group in word_groups:
-        group_key = group["group_key"]
-        word_stats[group_key] = {"count": 0, "titles": {}}
-
-    for source_id, titles_data in results_to_process.items():
-        total_titles += len(titles_data)
-
-        if source_id not in processed_titles:
-            processed_titles[source_id] = {}
-
-        for title, title_data in titles_data.items():
-            if title in processed_titles.get(source_id, {}):
-                continue
-
-            # 使用统一的匹配逻辑
-            matches_frequency_words = matches_word_groups(
-                title, word_groups, filter_words
-            )
-
-            if not matches_frequency_words:
-                continue
-
-            # 如果是增量模式或 current 模式第一次，统计匹配的新增新闻数量
-            if (mode == "incremental" and all_news_are_new) or (
-                mode == "current" and is_first_today
-            ):
-                matched_new_count += 1
-
-            source_ranks = title_data.get("ranks", [])
-            source_url = title_data.get("url", "")
-            source_mobile_url = title_data.get("mobileUrl", "")
-
-            # 找到匹配的词组（防御性转换确保类型安全）
-            title_lower = (
-                str(title).lower() if not isinstance(title, str) else title.lower()
-            )
-            for group in word_groups:
-                required_words = group["required"]
-                normal_words = group["normal"]
-
-                # 如果是"全部新闻"模式，所有标题都匹配第一个（唯一的）词组
-                if len(word_groups) == 1 and word_groups[0]["group_key"] == "全部新闻":
-                    group_key = group["group_key"]
-                    word_stats[group_key]["count"] += 1
-                    if source_id not in word_stats[group_key]["titles"]:
-                        word_stats[group_key]["titles"][source_id] = []
-                else:
-                    # 原有的匹配逻辑
-                    if required_words:
-                        all_required_present = all(
-                            req_word.lower() in title_lower
-                            for req_word in required_words
-                        )
-                        if not all_required_present:
-                            continue
-
-                    if normal_words:
-                        any_normal_present = any(
-                            normal_word.lower() in title_lower
-                            for normal_word in normal_words
-                        )
-                        if not any_normal_present:
-                            continue
-
-                    group_key = group["group_key"]
-                    word_stats[group_key]["count"] += 1
-                    if source_id not in word_stats[group_key]["titles"]:
-                        word_stats[group_key]["titles"][source_id] = []
-
-                first_time = ""
-                last_time = ""
-                count_info = 1
-                ranks = source_ranks if source_ranks else []
-                url = source_url
-                mobile_url = source_mobile_url
-
-                # 对于 current 模式，从历史统计信息中获取完整数据
-                if (
-                    mode == "current"
-                    and title_info
-                    and source_id in title_info
-                    and title in title_info[source_id]
-                ):
-                    info = title_info[source_id][title]
-                    first_time = info.get("first_time", "")
-                    last_time = info.get("last_time", "")
-                    count_info = info.get("count", 1)
-                    if "ranks" in info and info["ranks"]:
-                        ranks = info["ranks"]
-                    url = info.get("url", source_url)
-                    mobile_url = info.get("mobileUrl", source_mobile_url)
-                elif (
-                    title_info
-                    and source_id in title_info
-                    and title in title_info[source_id]
-                ):
-                    info = title_info[source_id][title]
-                    first_time = info.get("first_time", "")
-                    last_time = info.get("last_time", "")
-                    count_info = info.get("count", 1)
-                    if "ranks" in info and info["ranks"]:
-                        ranks = info["ranks"]
-                    url = info.get("url", source_url)
-                    mobile_url = info.get("mobileUrl", source_mobile_url)
-
-                if not ranks:
-                    ranks = [99]
-
-                time_display = format_time_display(first_time, last_time)
-
-                source_name = id_to_name.get(source_id, source_id)
-
-                # 判断是否为新增
-                is_new = False
-                if all_news_are_new:
-                    # 增量模式下所有处理的新闻都是新增，或者当天第一次的所有新闻都是新增
-                    is_new = True
-                elif new_titles and source_id in new_titles:
-                    # 检查是否在新增列表中
-                    new_titles_for_source = new_titles[source_id]
-                    is_new = title in new_titles_for_source
-
-                word_stats[group_key]["titles"][source_id].append(
-                    {
-                        "title": title,
-                        "source_name": source_name,
-                        "first_time": first_time,
-                        "last_time": last_time,
-                        "time_display": time_display,
-                        "count": count_info,
-                        "ranks": ranks,
-                        "rank_threshold": rank_threshold,
-                        "url": url,
-                        "mobileUrl": mobile_url,
-                        "is_new": is_new,
-                    }
-                )
-
-                if source_id not in processed_titles:
-                    processed_titles[source_id] = {}
-                processed_titles[source_id][title] = True
-
-                break
-
-    # 最后统一打印汇总信息
-    if mode == "incremental":
-        if is_first_today:
-            total_input_news = sum(len(titles) for titles in results.values())
-            filter_status = (
-                "全部显示"
-                if len(word_groups) == 1 and word_groups[0]["group_key"] == "全部新闻"
-                else "频率词匹配"
-            )
-            print(
-                f"增量模式：当天第一次爬取，{total_input_news} 条新闻中有 {matched_new_count} 条{filter_status}"
-            )
-        else:
-            if new_titles:
-                total_new_count = sum(len(titles) for titles in new_titles.values())
-                filter_status = (
-                    "全部显示"
-                    if len(word_groups) == 1
-                    and word_groups[0]["group_key"] == "全部新闻"
-                    else "匹配频率词"
-                )
-                print(
-                    f"增量模式：{total_new_count} 条新增新闻中，有 {matched_new_count} 条{filter_status}"
-                )
-                if matched_new_count == 0 and len(word_groups) > 1:
-                    print("增量模式：没有新增新闻匹配频率词，将不会发送通知")
-            else:
-                print("增量模式：未检测到新增新闻")
-    elif mode == "current":
-        total_input_news = sum(len(titles) for titles in results_to_process.values())
-        if is_first_today:
-            filter_status = (
-                "全部显示"
-                if len(word_groups) == 1 and word_groups[0]["group_key"] == "全部新闻"
-                else "频率词匹配"
-            )
-            print(
-                f"当前榜单模式：当天第一次爬取，{total_input_news} 条当前榜单新闻中有 {matched_new_count} 条{filter_status}"
-            )
-        else:
-            matched_count = sum(stat["count"] for stat in word_stats.values())
-            filter_status = (
-                "全部显示"
-                if len(word_groups) == 1 and word_groups[0]["group_key"] == "全部新闻"
-                else "频率词匹配"
-            )
-            print(
-                f"当前榜单模式：{total_input_news} 条当前榜单新闻中有 {matched_count} 条{filter_status}"
-            )
-
-    stats = []
-    # 创建 group_key 到位置和最大数量的映射
-    group_key_to_position = {
-        group["group_key"]: idx for idx, group in enumerate(word_groups)
-    }
-    group_key_to_max_count = {
-        group["group_key"]: group.get("max_count", 0) for group in word_groups
-    }
-
-    for group_key, data in word_stats.items():
-        all_titles = []
-        for source_id, title_list in data["titles"].items():
-            all_titles.extend(title_list)
-
-        # 按权重排序
-        sorted_titles = sorted(
-            all_titles,
-            key=lambda x: (
-                -calculate_news_weight(x, rank_threshold),
-                min(x["ranks"]) if x["ranks"] else 999,
-                -x["count"],
-            ),
-        )
-
-        # 应用最大显示数量限制（优先级：单独配置 > 全局配置）
-        group_max_count = group_key_to_max_count.get(group_key, 0)
-        if group_max_count == 0:
-            # 使用全局配置
-            group_max_count = CONFIG.get("MAX_NEWS_PER_KEYWORD", 0)
-
-        if group_max_count > 0:
-            sorted_titles = sorted_titles[:group_max_count]
-
-        stats.append(
-            {
-                "word": group_key,
-                "count": data["count"],
-                "position": group_key_to_position.get(group_key, 999),
-                "titles": sorted_titles,
-                "percentage": (
-                    round(data["count"] / total_titles * 100, 2)
-                    if total_titles > 0
-                    else 0
-                ),
-            }
-        )
-
-    # 根据配置选择排序优先级
-    if CONFIG.get("SORT_BY_POSITION_FIRST", False):
-        # 先按配置位置，再按热点条数
-        stats.sort(key=lambda x: (x["position"], -x["count"]))
-    else:
-        # 先按热点条数，再按配置位置（原逻辑）
-        stats.sort(key=lambda x: (-x["count"], x["position"]))
-
-    return stats, total_titles
 
 
 # === 报告生成 ===
@@ -2202,15 +336,15 @@ def render_html_content(
         <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js" integrity="sha512-BNaRQnYJYiPSqHHDb58B0yaPfCu+Wgds8Gp/gU33kqBtgNS4tSPHuGibyoeqMV/TJlSKda6FXzoEyYGjTe+vXA==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
         <style>
             * { box-sizing: border-box; }
-            body { 
+            body {
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
-                margin: 0; 
-                padding: 16px; 
+                margin: 0;
+                padding: 16px;
                 background: #fafafa;
                 color: #333;
                 line-height: 1.5;
             }
-            
+
             .container {
                 max-width: 600px;
                 margin: 0 auto;
@@ -2219,7 +353,7 @@ def render_html_content(
                 overflow: hidden;
                 box-shadow: 0 2px 16px rgba(0,0,0,0.06);
             }
-            
+
             .header {
                 background: linear-gradient(135deg, #4f46e5 0%, #7c3aed 100%);
                 color: white;
@@ -2227,7 +361,7 @@ def render_html_content(
                 text-align: center;
                 position: relative;
             }
-            
+
             .save-buttons {
                 position: absolute;
                 top: 16px;
@@ -2235,7 +369,7 @@ def render_html_content(
                 display: flex;
                 gap: 8px;
             }
-            
+
             .save-btn {
                 background: rgba(255, 255, 255, 0.2);
                 border: 1px solid rgba(255, 255, 255, 0.3);
@@ -2249,28 +383,28 @@ def render_html_content(
                 backdrop-filter: blur(10px);
                 white-space: nowrap;
             }
-            
+
             .save-btn:hover {
                 background: rgba(255, 255, 255, 0.3);
                 border-color: rgba(255, 255, 255, 0.5);
                 transform: translateY(-1px);
             }
-            
+
             .save-btn:active {
                 transform: translateY(0);
             }
-            
+
             .save-btn:disabled {
                 opacity: 0.6;
                 cursor: not-allowed;
             }
-            
+
             .header-title {
                 font-size: 22px;
                 font-weight: 700;
                 margin: 0 0 20px 0;
             }
-            
+
             .header-info {
                 display: grid;
                 grid-template-columns: 1fr 1fr;
@@ -2278,35 +412,35 @@ def render_html_content(
                 font-size: 14px;
                 opacity: 0.95;
             }
-            
+
             .info-item {
                 text-align: center;
             }
-            
+
             .info-label {
                 display: block;
                 font-size: 12px;
                 opacity: 0.8;
                 margin-bottom: 4px;
             }
-            
+
             .info-value {
                 font-weight: 600;
                 font-size: 16px;
             }
-            
+
             .content {
                 padding: 24px;
             }
-            
+
             .word-group {
                 margin-bottom: 40px;
             }
-            
+
             .word-group:first-child {
                 margin-top: 0;
             }
-            
+
             .word-header {
                 display: flex;
                 align-items: center;
@@ -2315,33 +449,33 @@ def render_html_content(
                 padding-bottom: 8px;
                 border-bottom: 1px solid #f0f0f0;
             }
-            
+
             .word-info {
                 display: flex;
                 align-items: center;
                 gap: 12px;
             }
-            
+
             .word-name {
                 font-size: 17px;
                 font-weight: 600;
                 color: #1a1a1a;
             }
-            
+
             .word-count {
                 color: #666;
                 font-size: 13px;
                 font-weight: 500;
             }
-            
+
             .word-count.hot { color: #dc2626; font-weight: 600; }
             .word-count.warm { color: #ea580c; font-weight: 600; }
-            
+
             .word-index {
                 color: #999;
                 font-size: 12px;
             }
-            
+
             .news-item {
                 margin-bottom: 20px;
                 padding: 16px 0;
@@ -2351,11 +485,11 @@ def render_html_content(
                 gap: 12px;
                 align-items: center;
             }
-            
+
             .news-item:last-child {
                 border-bottom: none;
             }
-            
+
             .news-item.new::after {
                 content: "NEW";
                 position: absolute;
@@ -2369,7 +503,7 @@ def render_html_content(
                 border-radius: 4px;
                 letter-spacing: 0.5px;
             }
-            
+
             .news-number {
                 color: #999;
                 font-size: 13px;
@@ -2387,17 +521,17 @@ def render_html_content(
                 align-self: flex-start;
                 margin-top: 8px;
             }
-            
+
             .news-content {
                 flex: 1;
                 min-width: 0;
                 padding-right: 40px;
             }
-            
+
             .news-item.new .news-content {
                 padding-right: 50px;
             }
-            
+
             .news-header {
                 display: flex;
                 align-items: center;
@@ -2405,13 +539,13 @@ def render_html_content(
                 margin-bottom: 8px;
                 flex-wrap: wrap;
             }
-            
+
             .source-name {
                 color: #666;
                 font-size: 12px;
                 font-weight: 500;
             }
-            
+
             .rank-num {
                 color: #fff;
                 background: #6b7280;
@@ -2422,58 +556,58 @@ def render_html_content(
                 min-width: 18px;
                 text-align: center;
             }
-            
+
             .rank-num.top { background: #dc2626; }
             .rank-num.high { background: #ea580c; }
-            
+
             .time-info {
                 color: #999;
                 font-size: 11px;
             }
-            
+
             .count-info {
                 color: #059669;
                 font-size: 11px;
                 font-weight: 500;
             }
-            
+
             .news-title {
                 font-size: 15px;
                 line-height: 1.4;
                 color: #1a1a1a;
                 margin: 0;
             }
-            
+
             .news-link {
                 color: #2563eb;
                 text-decoration: none;
             }
-            
+
             .news-link:hover {
                 text-decoration: underline;
             }
-            
+
             .news-link:visited {
                 color: #7c3aed;
             }
-            
+
             .new-section {
                 margin-top: 40px;
                 padding-top: 24px;
                 border-top: 2px solid #f0f0f0;
             }
-            
+
             .new-section-title {
                 color: #1a1a1a;
                 font-size: 16px;
                 font-weight: 600;
                 margin: 0 0 20px 0;
             }
-            
+
             .new-source-group {
                 margin-bottom: 24px;
             }
-            
+
             .new-source-title {
                 color: #666;
                 font-size: 13px;
@@ -2482,7 +616,7 @@ def render_html_content(
                 padding-bottom: 6px;
                 border-bottom: 1px solid #f5f5f5;
             }
-            
+
             .new-item {
                 display: flex;
                 align-items: center;
@@ -2490,11 +624,11 @@ def render_html_content(
                 padding: 8px 0;
                 border-bottom: 1px solid #f9f9f9;
             }
-            
+
             .new-item:last-child {
                 border-bottom: none;
             }
-            
+
             .new-item-number {
                 color: #999;
                 font-size: 12px;
@@ -2510,7 +644,7 @@ def render_html_content(
                 align-items: center;
                 justify-content: center;
             }
-            
+
             .new-item-rank {
                 color: #fff;
                 background: #6b7280;
@@ -2522,22 +656,22 @@ def render_html_content(
                 text-align: center;
                 flex-shrink: 0;
             }
-            
+
             .new-item-rank.top { background: #dc2626; }
             .new-item-rank.high { background: #ea580c; }
-            
+
             .new-item-content {
                 flex: 1;
                 min-width: 0;
             }
-            
+
             .new-item-title {
                 font-size: 14px;
                 line-height: 1.4;
                 color: #1a1a1a;
                 margin: 0;
             }
-            
+
             .error-section {
                 background: #fef2f2;
                 border: 1px solid #fecaca;
@@ -2545,27 +679,27 @@ def render_html_content(
                 padding: 16px;
                 margin-bottom: 24px;
             }
-            
+
             .error-title {
                 color: #dc2626;
                 font-size: 14px;
                 font-weight: 600;
                 margin: 0 0 8px 0;
             }
-            
+
             .error-list {
                 list-style: none;
                 padding: 0;
                 margin: 0;
             }
-            
+
             .error-item {
                 color: #991b1b;
                 font-size: 13px;
                 padding: 2px 0;
                 font-family: 'SF Mono', Consolas, monospace;
             }
-            
+
             .footer {
                 margin-top: 32px;
                 padding: 20px 24px;
@@ -2573,30 +707,30 @@ def render_html_content(
                 border-top: 1px solid #e5e7eb;
                 text-align: center;
             }
-            
+
             .footer-content {
                 font-size: 13px;
                 color: #6b7280;
                 line-height: 1.6;
             }
-            
+
             .footer-link {
                 color: #4f46e5;
                 text-decoration: none;
                 font-weight: 500;
                 transition: color 0.2s ease;
             }
-            
+
             .footer-link:hover {
                 color: #7c3aed;
                 text-decoration: underline;
             }
-            
+
             .project-name {
                 font-weight: 600;
                 color: #374151;
             }
-            
+
             @media (max-width: 480px) {
                 body { padding: 12px; }
                 .header { padding: 24px 20px; }
@@ -2684,7 +818,7 @@ def render_html_content(
                     </div>
                 </div>
             </div>
-            
+
             <div class="content">"""
 
     # 处理失败ID错误信息
@@ -2864,10 +998,10 @@ def render_html_content(
 
     html += """
             </div>
-            
+
             <div class="footer">
                 <div class="footer-content">
-                    由 <span class="project-name">TrendRadar</span> 生成 · 
+                    由 <span class="project-name">TrendRadar</span> 生成 ·
                     <a href="https://github.com/sansan0/TrendRadar" target="_blank" class="footer-link">
                         GitHub 开源项目
                     </a>"""
@@ -2883,29 +1017,29 @@ def render_html_content(
                 </div>
             </div>
         </div>
-        
+
         <script>
             async function saveAsImage() {
                 const button = event.target;
                 const originalText = button.textContent;
-                
+
                 try {
                     button.textContent = '生成中...';
                     button.disabled = true;
                     window.scrollTo(0, 0);
-                    
+
                     // 等待页面稳定
                     await new Promise(resolve => setTimeout(resolve, 200));
-                    
+
                     // 截图前隐藏按钮
                     const buttons = document.querySelector('.save-buttons');
                     buttons.style.visibility = 'hidden';
-                    
+
                     // 再次等待确保按钮完全隐藏
                     await new Promise(resolve => setTimeout(resolve, 100));
-                    
+
                     const container = document.querySelector('.container');
-                    
+
                     const canvas = await html2canvas(container, {
                         backgroundColor: '#ffffff',
                         scale: 1.5,
@@ -2924,27 +1058,27 @@ def render_html_content(
                         windowWidth: window.innerWidth,
                         windowHeight: window.innerHeight
                     });
-                    
+
                     buttons.style.visibility = 'visible';
-                    
+
                     const link = document.createElement('a');
                     const now = new Date();
                     const filename = `TrendRadar_热点新闻分析_${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}.png`;
-                    
+
                     link.download = filename;
                     link.href = canvas.toDataURL('image/png', 1.0);
-                    
+
                     // 触发下载
                     document.body.appendChild(link);
                     link.click();
                     document.body.removeChild(link);
-                    
+
                     button.textContent = '保存成功!';
                     setTimeout(() => {
                         button.textContent = originalText;
                         button.disabled = false;
                     }, 2000);
-                    
+
                 } catch (error) {
                     const buttons = document.querySelector('.save-buttons');
                     buttons.style.visibility = 'visible';
@@ -2955,18 +1089,18 @@ def render_html_content(
                     }, 2000);
                 }
             }
-            
+
             async function saveAsMultipleImages() {
                 const button = event.target;
                 const originalText = button.textContent;
                 const container = document.querySelector('.container');
-                const scale = 1.5; 
+                const scale = 1.5;
                 const maxHeight = 5000 / scale;
-                
+
                 try {
                     button.textContent = '分析中...';
                     button.disabled = true;
-                    
+
                     // 获取所有可能的分割元素
                     const newsItems = Array.from(container.querySelectorAll('.news-item'));
                     const wordGroups = Array.from(container.querySelectorAll('.word-group'));
@@ -2974,11 +1108,11 @@ def render_html_content(
                     const errorSection = container.querySelector('.error-section');
                     const header = container.querySelector('.header');
                     const footer = container.querySelector('.footer');
-                    
+
                     // 计算元素位置和高度
                     const containerRect = container.getBoundingClientRect();
                     const elements = [];
-                    
+
                     // 添加header作为必须包含的元素
                     elements.push({
                         type: 'header',
@@ -2987,7 +1121,7 @@ def render_html_content(
                         bottom: header.offsetHeight,
                         height: header.offsetHeight
                     });
-                    
+
                     // 添加错误信息（如果存在）
                     if (errorSection) {
                         const rect = errorSection.getBoundingClientRect();
@@ -2999,12 +1133,12 @@ def render_html_content(
                             height: rect.height
                         });
                     }
-                    
+
                     // 按word-group分组处理news-item
                     wordGroups.forEach(group => {
                         const groupRect = group.getBoundingClientRect();
                         const groupNewsItems = group.querySelectorAll('.news-item');
-                        
+
                         // 添加word-group的header部分
                         const wordHeader = group.querySelector('.word-header');
                         if (wordHeader) {
@@ -3018,7 +1152,7 @@ def render_html_content(
                                 height: headerRect.height
                             });
                         }
-                        
+
                         // 添加每个news-item
                         groupNewsItems.forEach(item => {
                             const rect = item.getBoundingClientRect();
@@ -3032,7 +1166,7 @@ def render_html_content(
                             });
                         });
                     });
-                    
+
                     // 添加新增新闻部分
                     if (newSection) {
                         const rect = newSection.getBoundingClientRect();
@@ -3044,7 +1178,7 @@ def render_html_content(
                             height: rect.height
                         });
                     }
-                    
+
                     // 添加footer
                     const footerRect = footer.getBoundingClientRect();
                     elements.push({
@@ -3054,23 +1188,23 @@ def render_html_content(
                         bottom: footerRect.bottom - containerRect.top,
                         height: footer.offsetHeight
                     });
-                    
+
                     // 计算分割点
                     const segments = [];
                     let currentSegment = { start: 0, end: 0, height: 0, includeHeader: true };
                     let headerHeight = header.offsetHeight;
                     currentSegment.height = headerHeight;
-                    
+
                     for (let i = 1; i < elements.length; i++) {
                         const element = elements[i];
                         const potentialHeight = element.bottom - currentSegment.start;
-                        
+
                         // 检查是否需要创建新分段
                         if (potentialHeight > maxHeight && currentSegment.height > headerHeight) {
                             // 在前一个元素结束处分割
                             currentSegment.end = elements[i - 1].bottom;
                             segments.push(currentSegment);
-                            
+
                             // 开始新分段
                             currentSegment = {
                                 start: currentSegment.end,
@@ -3083,25 +1217,25 @@ def render_html_content(
                             currentSegment.end = element.bottom;
                         }
                     }
-                    
+
                     // 添加最后一个分段
                     if (currentSegment.height > 0) {
                         currentSegment.end = container.offsetHeight;
                         segments.push(currentSegment);
                     }
-                    
+
                     button.textContent = `生成中 (0/${segments.length})...`;
-                    
+
                     // 隐藏保存按钮
                     const buttons = document.querySelector('.save-buttons');
                     buttons.style.visibility = 'hidden';
-                    
+
                     // 为每个分段生成图片
                     const images = [];
                     for (let i = 0; i < segments.length; i++) {
                         const segment = segments[i];
                         button.textContent = `生成中 (${i + 1}/${segments.length})...`;
-                        
+
                         // 创建临时容器用于截图
                         const tempContainer = document.createElement('div');
                         tempContainer.style.cssText = `
@@ -3112,22 +1246,22 @@ def render_html_content(
                             background: white;
                         `;
                         tempContainer.className = 'container';
-                        
+
                         // 克隆容器内容
                         const clonedContainer = container.cloneNode(true);
-                        
+
                         // 移除克隆内容中的保存按钮
                         const clonedButtons = clonedContainer.querySelector('.save-buttons');
                         if (clonedButtons) {
                             clonedButtons.style.display = 'none';
                         }
-                        
+
                         tempContainer.appendChild(clonedContainer);
                         document.body.appendChild(tempContainer);
-                        
+
                         // 等待DOM更新
                         await new Promise(resolve => setTimeout(resolve, 100));
-                        
+
                         // 使用html2canvas截取特定区域
                         const canvas = await html2canvas(clonedContainer, {
                             backgroundColor: '#ffffff',
@@ -3143,20 +1277,20 @@ def render_html_content(
                             windowWidth: window.innerWidth,
                             windowHeight: window.innerHeight
                         });
-                        
+
                         images.push(canvas.toDataURL('image/png', 1.0));
-                        
+
                         // 清理临时容器
                         document.body.removeChild(tempContainer);
                     }
-                    
+
                     // 恢复按钮显示
                     buttons.style.visibility = 'visible';
-                    
+
                     // 下载所有图片
                     const now = new Date();
                     const baseFilename = `TrendRadar_热点新闻分析_${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}_${String(now.getHours()).padStart(2, '0')}${String(now.getMinutes()).padStart(2, '0')}`;
-                    
+
                     for (let i = 0; i < images.length; i++) {
                         const link = document.createElement('a');
                         link.download = `${baseFilename}_part${i + 1}.png`;
@@ -3164,17 +1298,17 @@ def render_html_content(
                         document.body.appendChild(link);
                         link.click();
                         document.body.removeChild(link);
-                        
+
                         // 延迟一下避免浏览器阻止多个下载
                         await new Promise(resolve => setTimeout(resolve, 100));
                     }
-                    
+
                     button.textContent = `已保存 ${segments.length} 张图片!`;
                     setTimeout(() => {
                         button.textContent = originalText;
                         button.disabled = false;
                     }, 2000);
-                    
+
                 } catch (error) {
                     console.error('分段保存失败:', error);
                     const buttons = document.querySelector('.save-buttons');
@@ -3186,7 +1320,7 @@ def render_html_content(
                     }, 2000);
                 }
             }
-            
+
             document.addEventListener('DOMContentLoaded', function() {
                 window.scrollTo(0, 0);
             });
@@ -4775,566 +2909,3 @@ def send_to_bark(
     else:
         print(f"Bark发送完全失败 [{report_type}]")
         return False
-
-
-# === 主分析器 ===
-class NewsAnalyzer:
-    """新闻分析器"""
-
-    # 模式策略定义
-    MODE_STRATEGIES = {
-        "incremental": {
-            "mode_name": "增量模式",
-            "description": "增量模式（只关注新增新闻，无新增时不推送）",
-            "realtime_report_type": "实时增量",
-            "summary_report_type": "当日汇总",
-            "should_send_realtime": True,
-            "should_generate_summary": True,
-            "summary_mode": "daily",
-        },
-        "current": {
-            "mode_name": "当前榜单模式",
-            "description": "当前榜单模式（当前榜单匹配新闻 + 新增新闻区域 + 按时推送）",
-            "realtime_report_type": "实时当前榜单",
-            "summary_report_type": "当前榜单汇总",
-            "should_send_realtime": True,
-            "should_generate_summary": True,
-            "summary_mode": "current",
-        },
-        "daily": {
-            "mode_name": "当日汇总模式",
-            "description": "当日汇总模式（所有匹配新闻 + 新增新闻区域 + 按时推送）",
-            "realtime_report_type": "",
-            "summary_report_type": "当日汇总",
-            "should_send_realtime": False,
-            "should_generate_summary": True,
-            "summary_mode": "daily",
-        },
-        "llm_analysis": {
-            "mode_name": "大模型汇总模式",
-            "description": "大模型汇总模式（总结所有匹配新闻 + 按时推送）",
-            "realtime_report_type": "",
-            "summary_report_type": "大模型总结",
-            "should_send_realtime": True,
-            "should_generate_summary": False,
-            "summary_mode": "llm_analysis",
-        },
-    }
-
-    def __init__(self):
-        self.request_interval = CONFIG["REQUEST_INTERVAL"]
-        self.report_mode = CONFIG["REPORT_MODE"]
-        self.rank_threshold = CONFIG["RANK_THRESHOLD"]
-        self.is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
-        self.is_docker_container = self._detect_docker_environment()
-        self.update_info = None
-        self.proxy_url = None
-        self._setup_proxy()
-        self.data_fetcher = DataFetcher(self.proxy_url)
-        self.llm_analyzer = LLMAnalyzer() if CONFIG["LLM_KEY"] else None
-
-        if self.is_github_actions:
-            self._check_version_update()
-
-    def _detect_docker_environment(self) -> bool:
-        """检测是否运行在 Docker 容器中"""
-        try:
-            if os.environ.get("DOCKER_CONTAINER") == "true":
-                return True
-
-            if os.path.exists("/.dockerenv"):
-                return True
-
-            return False
-        except Exception:
-            return False
-
-    def _should_open_browser(self) -> bool:
-        """判断是否应该打开浏览器"""
-        return not self.is_github_actions and not self.is_docker_container
-
-    def _setup_proxy(self) -> None:
-        """设置代理配置"""
-        if not self.is_github_actions and CONFIG["USE_PROXY"]:
-            self.proxy_url = CONFIG["DEFAULT_PROXY"]
-            print("本地环境，使用代理")
-        elif not self.is_github_actions and not CONFIG["USE_PROXY"]:
-            print("本地环境，未启用代理")
-        else:
-            print("GitHub Actions环境，不使用代理")
-
-    def _check_version_update(self) -> None:
-        """检查版本更新"""
-        try:
-            need_update, remote_version = check_version_update(
-                VERSION, CONFIG["VERSION_CHECK_URL"], self.proxy_url
-            )
-
-            if need_update and remote_version:
-                self.update_info = {
-                    "current_version": VERSION,
-                    "remote_version": remote_version,
-                }
-                print(f"发现新版本: {remote_version} (当前: {VERSION})")
-            else:
-                print("版本检查完成，当前为最新版本")
-        except Exception as e:
-            print(f"版本检查出错: {e}")
-
-    def _get_mode_strategy(self) -> Dict:
-        """获取当前模式的策略配置"""
-        return self.MODE_STRATEGIES.get(self.report_mode, self.MODE_STRATEGIES["daily"])
-
-    def _has_notification_configured(self) -> bool:
-        """检查是否配置了任何通知渠道"""
-        return any(
-            [
-                CONFIG["FEISHU_WEBHOOK_URL"],
-                CONFIG["DINGTALK_WEBHOOK_URL"],
-                CONFIG["WEWORK_WEBHOOK_URL"],
-                (CONFIG["TELEGRAM_BOT_TOKEN"] and CONFIG["TELEGRAM_CHAT_ID"]),
-                (
-                    CONFIG["EMAIL_FROM"]
-                    and CONFIG["EMAIL_PASSWORD"]
-                    and CONFIG["EMAIL_TO"]
-                ),
-                (CONFIG["NTFY_SERVER_URL"] and CONFIG["NTFY_TOPIC"]),
-                CONFIG["BARK_URL"],
-            ]
-        )
-
-    def _has_valid_content(
-        self, stats: List[Dict], new_titles: Optional[Dict] = None
-    ) -> bool:
-        """检查是否有有效的新闻内容"""
-        if self.report_mode in ["incremental", "current"]:
-            # 增量模式和current模式下，只要stats有内容就说明有匹配的新闻
-            return any(stat["count"] > 0 for stat in stats)
-        else:
-            # 当日汇总模式下，检查是否有匹配的频率词新闻或新增新闻
-            has_matched_news = any(stat["count"] > 0 for stat in stats)
-            has_new_news = bool(
-                new_titles and any(len(titles) > 0 for titles in new_titles.values())
-            )
-            return has_matched_news or has_new_news
-
-    def _load_analysis_data(
-        self,
-    ) -> Optional[Tuple[Dict, Dict, Dict, Dict, List, List]]:
-        """统一的数据加载和预处理，使用当前监控平台列表过滤历史数据"""
-        try:
-            # 获取当前配置的监控平台ID列表
-            current_platform_ids = []
-            for platform in CONFIG["PLATFORMS"]:
-                current_platform_ids.append(platform["id"])
-
-            print(f"当前监控平台: {current_platform_ids}")
-
-            all_results, id_to_name, title_info = read_all_today_titles(
-                current_platform_ids
-            )
-
-            if not all_results:
-                print("没有找到当天的数据")
-                return None
-
-            total_titles = sum(len(titles) for titles in all_results.values())
-            print(f"读取到 {total_titles} 个标题（已按当前监控平台过滤）")
-
-            new_titles = detect_latest_new_titles(current_platform_ids)
-            word_groups, filter_words = load_frequency_words()
-
-            return (
-                all_results,
-                id_to_name,
-                title_info,
-                new_titles,
-                word_groups,
-                filter_words,
-            )
-        except Exception as e:
-            print(f"数据加载失败: {e}")
-            return None
-
-    def _prepare_current_title_info(self, results: Dict, time_info: str) -> Dict:
-        """从当前抓取结果构建标题信息"""
-        title_info = {}
-        for source_id, titles_data in results.items():
-            title_info[source_id] = {}
-            for title, title_data in titles_data.items():
-                ranks = title_data.get("ranks", [])
-                url = title_data.get("url", "")
-                mobile_url = title_data.get("mobileUrl", "")
-
-                title_info[source_id][title] = {
-                    "first_time": time_info,
-                    "last_time": time_info,
-                    "count": 1,
-                    "ranks": ranks,
-                    "url": url,
-                    "mobileUrl": mobile_url,
-                }
-        return title_info
-
-    def _run_analysis_pipeline(
-        self,
-        data_source: Dict,
-        mode: str,
-        title_info: Dict,
-        new_titles: Dict,
-        word_groups: List[Dict],
-        filter_words: List[str],
-        id_to_name: Dict,
-        failed_ids: Optional[List] = None,
-        is_daily_summary: bool = False,
-    ) -> Tuple[List[Dict], str]:
-        """统一的分析流水线：数据处理 → 统计计算 → HTML生成"""
-
-        if self.llm_analyzer and mode == "llm_analysis":
-            result = self.llm_analyzer.news_analyze(data_source)
-            if result is not None:
-                return result
-
-        # 统计计算
-        stats, total_titles = count_word_frequency(
-            data_source,
-            word_groups,
-            filter_words,
-            id_to_name,
-            title_info,
-            self.rank_threshold,
-            new_titles,
-            mode=mode,
-        )
-
-        # HTML生成
-        html_file = generate_html_report(
-            stats,
-            total_titles,
-            failed_ids=failed_ids,
-            new_titles=new_titles,
-            id_to_name=id_to_name,
-            mode=mode,
-            is_daily_summary=is_daily_summary,
-            update_info=self.update_info if CONFIG["SHOW_VERSION_UPDATE"] else None,
-        )
-
-        return stats, html_file
-
-    def _send_notification_if_needed(
-        self,
-        stats: List[Dict],
-        report_type: str,
-        mode: str,
-        failed_ids: Optional[List] = None,
-        new_titles: Optional[Dict] = None,
-        id_to_name: Optional[Dict] = None,
-        html_file_path: Optional[str] = None,
-    ) -> bool:
-        """统一的通知发送逻辑，包含所有判断条件"""
-        has_notification = self._has_notification_configured()
-
-        if (
-            CONFIG["ENABLE_NOTIFICATION"]
-            and has_notification
-            and self._has_valid_content(stats, new_titles)
-        ):
-            send_to_notifications(
-                stats,
-                failed_ids or [],
-                report_type,
-                new_titles,
-                id_to_name,
-                self.update_info,
-                self.proxy_url,
-                mode=mode,
-                html_file_path=html_file_path,
-            )
-            return True
-        elif CONFIG["ENABLE_NOTIFICATION"] and not has_notification:
-            print("⚠️ 警告：通知功能已启用但未配置任何通知渠道，将跳过通知发送")
-        elif not CONFIG["ENABLE_NOTIFICATION"]:
-            print(f"跳过{report_type}通知：通知功能已禁用")
-        elif (
-            CONFIG["ENABLE_NOTIFICATION"]
-            and has_notification
-            and not self._has_valid_content(stats, new_titles)
-        ):
-            mode_strategy = self._get_mode_strategy()
-            if "实时" in report_type:
-                print(
-                    f"跳过实时推送通知：{mode_strategy['mode_name']}下未检测到匹配的新闻"
-                )
-            else:
-                print(
-                    f"跳过{mode_strategy['summary_report_type']}通知：未匹配到有效的新闻内容"
-                )
-
-        return False
-
-    def _generate_summary_report(self, mode_strategy: Dict) -> Optional[str]:
-        """生成汇总报告（带通知）"""
-        summary_type = (
-            "当前榜单汇总" if mode_strategy["summary_mode"] == "current" else "当日汇总"
-        )
-        print(f"生成{summary_type}报告...")
-
-        # 加载分析数据
-        analysis_data = self._load_analysis_data()
-        if not analysis_data:
-            return None
-
-        all_results, id_to_name, title_info, new_titles, word_groups, filter_words = (
-            analysis_data
-        )
-
-        # 运行分析流水线
-        stats, html_file = self._run_analysis_pipeline(
-            all_results,
-            mode_strategy["summary_mode"],
-            title_info,
-            new_titles,
-            word_groups,
-            filter_words,
-            id_to_name,
-            is_daily_summary=True,
-        )
-
-        print(f"{summary_type}报告已生成: {html_file}")
-
-        # 发送通知
-        self._send_notification_if_needed(
-            stats,
-            mode_strategy["summary_report_type"],
-            mode_strategy["summary_mode"],
-            failed_ids=[],
-            new_titles=new_titles,
-            id_to_name=id_to_name,
-            html_file_path=html_file,
-        )
-
-        return html_file
-
-    def _generate_summary_html(self, mode: str = "daily") -> Optional[str]:
-        """生成汇总HTML"""
-        summary_type = "当前榜单汇总" if mode == "current" else "当日汇总"
-        print(f"生成{summary_type}HTML...")
-
-        # 加载分析数据
-        analysis_data = self._load_analysis_data()
-        if not analysis_data:
-            return None
-
-        all_results, id_to_name, title_info, new_titles, word_groups, filter_words = (
-            analysis_data
-        )
-
-        # 运行分析流水线
-        _, html_file = self._run_analysis_pipeline(
-            all_results,
-            mode,
-            title_info,
-            new_titles,
-            word_groups,
-            filter_words,
-            id_to_name,
-            is_daily_summary=True,
-        )
-
-        print(f"{summary_type}HTML已生成: {html_file}")
-        return html_file
-
-    def _initialize_and_check_config(self) -> None:
-        """通用初始化和配置检查"""
-        now = get_beijing_time()
-        print(f"当前北京时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
-
-        if not CONFIG["ENABLE_CRAWLER"]:
-            print("爬虫功能已禁用（ENABLE_CRAWLER=False），程序退出")
-            return
-
-        has_notification = self._has_notification_configured()
-        if not CONFIG["ENABLE_NOTIFICATION"]:
-            print("通知功能已禁用（ENABLE_NOTIFICATION=False），将只进行数据抓取")
-        elif not has_notification:
-            print("未配置任何通知渠道，将只进行数据抓取，不发送通知")
-        else:
-            print("通知功能已启用，将发送通知")
-
-        mode_strategy = self._get_mode_strategy()
-        print(f"报告模式: {self.report_mode}")
-        print(f"运行模式: {mode_strategy['description']}")
-
-    def _crawl_data(self) -> Tuple[Dict, Dict, List]:
-        """执行数据爬取"""
-        ids = []
-        for platform in CONFIG["PLATFORMS"]:
-            if "name" in platform:
-                ids.append((platform["id"], platform["name"]))
-            else:
-                ids.append(platform["id"])
-
-        print(
-            f"配置的监控平台: {[p.get('name', p['id']) for p in CONFIG['PLATFORMS']]}"
-        )
-        print(f"开始爬取数据，请求间隔 {self.request_interval} 毫秒")
-        ensure_directory_exists("output")
-
-        results, id_to_name, failed_ids = self.data_fetcher.crawl_websites(
-            ids, self.request_interval
-        )
-
-        title_file = save_titles_to_file(results, id_to_name, failed_ids)
-        print(f"标题已保存到: {title_file}")
-
-        return results, id_to_name, failed_ids
-
-    def _execute_mode_strategy(
-        self, mode_strategy: Dict, results: Dict, id_to_name: Dict, failed_ids: List
-    ) -> Optional[str]:
-        """执行模式特定逻辑"""
-        # 获取当前监控平台ID列表
-        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
-
-        new_titles = detect_latest_new_titles(current_platform_ids)
-        time_info = Path(save_titles_to_file(results, id_to_name, failed_ids)).stem
-        word_groups, filter_words = load_frequency_words()
-
-        # current模式下，实时推送需要使用完整的历史数据来保证统计信息的完整性
-        if self.report_mode == "current":
-            # 加载完整的历史数据（已按当前平台过滤）
-            analysis_data = self._load_analysis_data()
-            if analysis_data:
-                (
-                    all_results,
-                    historical_id_to_name,
-                    historical_title_info,
-                    historical_new_titles,
-                    _,
-                    _,
-                ) = analysis_data
-
-                print(
-                    f"current模式：使用过滤后的历史数据，包含平台：{list(all_results.keys())}"
-                )
-
-                stats, html_file = self._run_analysis_pipeline(
-                    all_results,
-                    self.report_mode,
-                    historical_title_info,
-                    historical_new_titles,
-                    word_groups,
-                    filter_words,
-                    historical_id_to_name,
-                    failed_ids=failed_ids,
-                )
-
-                combined_id_to_name = {**historical_id_to_name, **id_to_name}
-
-                print(f"HTML报告已生成: {html_file}")
-
-                # 发送实时通知（使用完整历史数据的统计结果）
-                summary_html = None
-                if mode_strategy["should_send_realtime"]:
-                    self._send_notification_if_needed(
-                        stats,
-                        mode_strategy["realtime_report_type"],
-                        self.report_mode,
-                        failed_ids=failed_ids,
-                        new_titles=historical_new_titles,
-                        id_to_name=combined_id_to_name,
-                        html_file_path=html_file,
-                    )
-            else:
-                print("❌ 严重错误：无法读取刚保存的数据文件")
-                raise RuntimeError("数据一致性检查失败：保存后立即读取失败")
-        else:
-            title_info = self._prepare_current_title_info(results, time_info)
-            stats, html_file = self._run_analysis_pipeline(
-                results,
-                self.report_mode,
-                title_info,
-                new_titles,
-                word_groups,
-                filter_words,
-                id_to_name,
-                failed_ids=failed_ids,
-            )
-            print(f"HTML报告已生成: {html_file}")
-
-            # 发送实时通知（如果需要）
-            summary_html = None
-            if mode_strategy["should_send_realtime"]:
-                self._send_notification_if_needed(
-                    stats,
-                    mode_strategy["realtime_report_type"],
-                    self.report_mode,
-                    failed_ids=failed_ids,
-                    new_titles=new_titles,
-                    id_to_name=id_to_name,
-                    html_file_path=html_file,
-                )
-
-        # 生成汇总报告（如果需要）
-        summary_html = None
-        if mode_strategy["should_generate_summary"]:
-            if mode_strategy["should_send_realtime"]:
-                # 如果已经发送了实时通知，汇总只生成HTML不发送通知
-                summary_html = self._generate_summary_html(
-                    mode_strategy["summary_mode"]
-                )
-            else:
-                # daily模式：直接生成汇总报告并发送通知
-                summary_html = self._generate_summary_report(mode_strategy)
-
-        # 打开浏览器（仅在非容器环境）
-        if self._should_open_browser() and html_file:
-            if summary_html:
-                summary_url = "file://" + str(Path(summary_html).resolve())
-                print(f"正在打开汇总报告: {summary_url}")
-                webbrowser.open(summary_url)
-            else:
-                file_url = "file://" + str(Path(html_file).resolve())
-                print(f"正在打开HTML报告: {file_url}")
-                webbrowser.open(file_url)
-        elif self.is_docker_container and html_file:
-            if summary_html:
-                print(f"汇总报告已生成（Docker环境）: {summary_html}")
-            else:
-                print(f"HTML报告已生成（Docker环境）: {html_file}")
-
-        return summary_html
-
-    def run(self) -> None:
-        """执行分析流程"""
-        try:
-            self._initialize_and_check_config()
-
-            mode_strategy = self._get_mode_strategy()
-
-            results, id_to_name, failed_ids = self._crawl_data()
-
-            self._execute_mode_strategy(mode_strategy, results, id_to_name, failed_ids)
-
-        except Exception as e:
-            print(f"分析流程执行出错: {e}")
-            raise
-
-
-def main():
-    try:
-        analyzer = NewsAnalyzer()
-        analyzer.run()
-    except FileNotFoundError as e:
-        print(f"❌ 配置文件错误: {e}")
-        print("\n请确保以下文件存在:")
-        print("  • config/config.yaml")
-        print("  • config/frequency_words.txt")
-        print("\n参考项目文档进行正确配置")
-    except Exception as e:
-        print(f"❌ 程序运行错误: {e}")
-        raise
-
-
-if __name__ == "__main__":
-    main()
