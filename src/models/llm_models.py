@@ -6,8 +6,9 @@ from typing import List, Union
 
 class NewsTitle(BaseModel):
     """新闻标题模型"""
-    rank: Union[int, List[int]]  # 支持单个排名或排名列表
-    source: str
+    title: str = Field(description="新闻原标题")
+    rank: Union[int, List[int]] = Field(description="新闻在原热榜中的排序")  # 支持单个排名或排名列表
+    source: str = Field(description="新闻的来源平台")
 
 
 class NewsGroup(BaseModel):

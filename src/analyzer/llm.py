@@ -6,7 +6,7 @@ from json_repair import repair_json
 from pathlib import Path
 from push.sender import generate_html_report
 from crawler.process import read_all_today_titles
-from models.llm_models import NewsGroup
+from models.llm_models import NewsGroup, NewsTitle
 import os
 import re
 import json
@@ -45,7 +45,7 @@ class LLMAnalyzer:
     def _extract_and_validate_json(
         self, llm_response: str
     ) -> Optional[List[NewsGroup]]:
-        """从 LLM 响应中提取 JSON 并进行类型验证"""
+        """从 LLM 响应中提取 JSON 并进行类型验证，支持逐步过滤机制"""
         try:
             # 使用正则表达式提取 JSON 内容
             json_pattern = r"```json\s*\n(.*?)\n\s*```"
@@ -79,19 +79,95 @@ class LLMAnalyzer:
                     print("json-repair 库不可用，无法修复 JSON")
                     return None
 
-            # 使用 Pydantic 进行类型验证
+            if not isinstance(data, list):
+                print("JSON 数据不是列表格式")
+                return None
+
+            # 第一步：尝试直接验证所有数据
             try:
                 news_groups = [NewsGroup(**group) for group in data]
                 print(f"LLM JSON 验证成功，共 {len(news_groups)} 个新闻分组")
-                return news_groups
+                return self._check_data_quality(news_groups)
             except Exception as e:
-                print(f"Pydantic 类型验证失败: {e}")
-                print(f"解析的数据: {data}")
+                print(f"直接验证失败: {e}")
+                print("开始逐步过滤...")
+
+            # 第二步：过滤掉不正确的 NewsTitle
+            print("第二步：过滤不正确的 NewsTitle...")
+            filtered_groups_data = []
+            for group_data in data:
+                if not isinstance(group_data, dict):
+                    continue
+
+                filtered_news_titles = []
+                news_titles = group_data.get("news_title", [])
+
+                for news_title_data in news_titles:
+                    try:
+                        # 尝试创建 NewsTitle 对象
+                        NewsTitle(**news_title_data)
+                        filtered_news_titles.append(news_title_data)
+                    except Exception as e:
+                        print(f"过滤掉无效的 NewsTitle: {news_title_data}, 错误: {e}")
+
+                # 如果该分组还有有效的新闻标题，保留该分组
+                if filtered_news_titles:
+                    group_data_copy = group_data.copy()
+                    group_data_copy["news_title"] = filtered_news_titles
+                    filtered_groups_data.append(group_data_copy)
+
+            if not filtered_groups_data:
+                print("过滤 NewsTitle 后没有有效数据")
                 return None
+
+            # 尝试验证过滤后的数据
+            try:
+                news_groups = [NewsGroup(**group) for group in filtered_groups_data]
+                print(f"过滤 NewsTitle 后验证成功，共 {len(news_groups)} 个新闻分组")
+                return self._check_data_quality(news_groups)
+            except Exception as e:
+                print(f"过滤 NewsTitle 后仍然验证失败: {e}")
+
+            # 第三步：过滤掉不正确的 NewsGroup
+            print("第三步：过滤不正确的 NewsGroup...")
+            valid_groups = []
+            for group_data in filtered_groups_data:
+                try:
+                    group = NewsGroup(**group_data)
+                    valid_groups.append(group)
+                except Exception as e:
+                    print(f"过滤掉无效的 NewsGroup: {group_data.get('keywords', 'unknown')}, 错误: {e}")
+
+            if not valid_groups:
+                print("过滤 NewsGroup 后没有有效数据")
+                return None
+
+            print(f"过滤 NewsGroup 后验证成功，共 {len(valid_groups)} 个新闻分组")
+            return self._check_data_quality(valid_groups)
 
         except Exception as e:
             print(f"提取 JSON 时发生错误: {e}")
             return None
+
+    def _check_data_quality(self, news_groups: List[NewsGroup]) -> Optional[List[NewsGroup]]:
+        """检查数据质量，如果不满足最低要求则返回 None"""
+        if not news_groups:
+            print("数据质量检查失败：没有有效分组")
+            return None
+
+        # 检查分组数量：至少4个分组
+        if len(news_groups) < 4:
+            print(f"数据质量检查失败：分组数量不足，当前 {len(news_groups)} 个，需要至少 4 个")
+            return None
+
+        # 检查前三个分组的新闻数量：前三个分组至少要有4条新闻
+        top_3_news_count = sum(len(group.news_title) for group in news_groups[:3])
+        if top_3_news_count < 4:
+            print(f"数据质量检查失败：前三个分组新闻数量不足，当前 {top_3_news_count} 条，需要至少 4 条")
+            return None
+
+        print(f"数据质量检查通过：{len(news_groups)} 个分组，前三个分组共 {top_3_news_count} 条新闻")
+        return news_groups
 
     def _prepare_news_title(self, news_title: List[Dict[str, str | List[str]]]) -> str:
         """将新闻数据转换为大模型可读的 Markdown 格式文本"""
@@ -130,31 +206,19 @@ class LLMAnalyzer:
             # 构建titles数据
             titles = []
             for news_title in group.news_title:
-                # 获取rank值（如果是列表取第一个）
-                rank_value = (
-                    news_title.rank[0]
-                    if isinstance(news_title.rank, list)
-                    else news_title.rank
-                )
+                # 直接使用 LLM 输出的标题
+                llm_title = news_title.title
 
-                # 从title_info中查找对应的新闻详细信息（使用去重后的数据）
-                news_detail = self._find_news_detail_from_title_info(
-                    rank_value, news_title.source, deduplicated_data_source, title_info
-                )
-
-                first_time = news_detail.get("first_time", "")
-                last_time = news_detail.get("last_time", "")
-
-                # 根据rank查找原始标题
-                original_title = self._find_original_title_by_rank(
-                    rank_value, news_title.source, deduplicated_data_source
+                # 从title_info中查找对应的新闻详细信息（可选，用于获取时间等额外信息）
+                news_detail = self._find_news_detail_by_title(
+                    llm_title, news_title.source, deduplicated_data_source, title_info
                 )
 
                 title_data = {
-                    "title": original_title,
+                    "title": llm_title,  # 直接使用 LLM 输出的标题
                     "source_name": news_title.source,
-                    "first_time": first_time,
-                    "last_time": last_time,
+                    "first_time": news_detail.get("first_time", ""),
+                    "last_time": news_detail.get("last_time", ""),
                     "time_display": format_time_display(
                         news_detail.get("first_time", ""),
                         news_detail.get("last_time", ""),
@@ -187,6 +251,59 @@ class LLMAnalyzer:
             )
 
         return stats
+
+    def _find_news_detail_by_title(
+        self, title: str, source: str, deduplicated_data_source: Dict, title_info: Dict
+    ) -> Dict:
+        """根据标题和来源查找新闻的详细信息"""
+        # 根据source查找对应的platform_id
+        platform_id = None
+        for platform in CONFIG["PLATFORMS"]:
+            if platform.get("name") == source or platform["id"] == source:
+                platform_id = platform["id"]
+                break
+
+        if not platform_id:
+            return {}
+
+        # 在去重后的数据中查找匹配的标题
+        if platform_id in deduplicated_data_source:
+            for stored_title, title_data in deduplicated_data_source[platform_id].items():
+                # 精确匹配或包含匹配
+                if title == stored_title or title in stored_title or stored_title in title:
+                    # 从title_info中获取完整的统计信息
+                    if (platform_id in title_info and
+                        stored_title in title_info[platform_id]):
+                        info = title_info[platform_id][stored_title]
+                        return {
+                            "first_time": info.get("first_time", ""),
+                            "last_time": info.get("last_time", ""),
+                            "count": info.get("count", 1),
+                            "url": info.get("url", title_data.get("url", "")),
+                            "mobile_url": info.get("mobileUrl", title_data.get("mobileUrl", "")),
+                            "is_new": False,
+                        }
+                    else:
+                        # 如果在title_info中找不到，使用基本信息
+                        ranks = title_data.get("ranks", [])
+                        return {
+                            "first_time": "",
+                            "last_time": "",
+                            "count": len(ranks) if ranks else 1,
+                            "url": title_data.get("url", ""),
+                            "mobile_url": title_data.get("mobileUrl", ""),
+                            "is_new": False,
+                        }
+
+        # 如果找不到匹配的标题，返回默认值
+        return {
+            "first_time": "",
+            "last_time": "",
+            "count": 1,
+            "url": "",
+            "mobile_url": "",
+            "is_new": False,
+        }
 
     def _find_news_detail_from_title_info(self, rank: int, source: str, deduplicated_data_source: Dict, title_info: Dict) -> Dict:
         """从title_info中根据rank和source查找新闻的详细信息（使用去重后的数据）"""
@@ -255,27 +372,6 @@ class LLMAnalyzer:
 
         return {}
 
-    def _find_original_title_by_rank(
-        self, rank: int, source: str, data_source: Dict
-    ) -> str:
-        """从data_source中根据rank查找原始新闻标题"""
-        # 根据source查找对应的platform_id
-        platform_id = None
-        for platform in CONFIG["PLATFORMS"]:
-            if platform.get("name") == source or platform["id"] == source:
-                platform_id = platform["id"]
-                break
-
-        if not platform_id or platform_id not in data_source:
-            return ""
-
-        # 在该平台的数据中根据rank查找对应的原始标题
-        for stored_title, title_data in data_source[platform_id].items():
-            ranks = title_data.get("ranks", [])
-            if rank in ranks:
-                return stored_title
-
-        return ""
 
     def _generate_llm_html_report(
         self, stats: List[Dict], validated_groups: List[NewsGroup], data_source: Dict
@@ -421,6 +517,7 @@ class LLMAnalyzer:
                 {"role": "user", "content": self._prepare_news_title(news_titles)},
             ],
             stream=False,
+            max_completion_tokens=8000
         )
 
         llm_summary = response.choices[0].message.content

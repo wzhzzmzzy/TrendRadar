@@ -19,6 +19,11 @@ from .llm_models import (
     NewsGroup,
 )
 
+from .analyzer_models import (
+    AnalysisData,
+    ModeStrategy,
+)
+
 __all__ = [
     # 配置相关模型
     "AppConfig",
@@ -35,4 +40,7 @@ __all__ = [
     # LLM 分析相关模型
     "NewsTitle",
     "NewsGroup",
+    # 分析器相关模型
+    "AnalysisData",
+    "ModeStrategy",
 ]
