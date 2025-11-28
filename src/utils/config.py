@@ -42,6 +42,10 @@ def load_config() -> TrendRadarConfig:
         in ("true", "1")
         if os.environ.get("ENABLE_CRAWLER", "").strip()
         else config_data["crawler"]["enable_crawler"],
+        "ONLY_CRAWLER": os.environ.get("ONLY_CRAWLER", "").strip().lower()
+        in ("true", "1")
+        if os.environ.get("ONLY_CRAWLER", "").strip()
+        else config_data["crawler"]["only_crawler"],
         "ENABLE_NOTIFICATION": os.environ.get("ENABLE_NOTIFICATION", "").strip().lower()
         in ("true", "1")
         if os.environ.get("ENABLE_NOTIFICATION", "").strip()

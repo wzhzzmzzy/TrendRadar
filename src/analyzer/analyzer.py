@@ -29,6 +29,9 @@ class NewsAnalyzer:
         self.data_fetcher = DataFetcher(self.proxy_url)
         self.llm_analyzer = LLMAnalyzer() if CONFIG.LLM_KEY else None
 
+        # 缓存 save_titles_to_file 的结果
+        self._cached_title_file: Optional[str] = None
+
         if self.is_github_actions:
             self._check_version_update()
 
@@ -346,8 +349,9 @@ class NewsAnalyzer:
         print(f"当前北京时间: {now.strftime('%Y-%m-%d %H:%M:%S')}")
 
         if not CONFIG["ENABLE_CRAWLER"]:
-            print("爬虫功能已禁用（ENABLE_CRAWLER=False），程序退出")
-            return
+            print("爬虫功能已禁用（ENABLE_CRAWLER=False），将使用历史数据生成分析报告")
+        elif CONFIG["ONLY_CRAWLER"]:
+            print("仅爬取模式已启用（ONLY_CRAWLER=True），将只执行数据爬取，跳过分析和推送")
 
         has_notification = self._has_notification_configured()
         if not CONFIG["ENABLE_NOTIFICATION"]:
@@ -380,137 +384,255 @@ class NewsAnalyzer:
             ids, self.request_interval
         )
 
-        title_file = save_titles_to_file(results, id_to_name, failed_ids)
-        print(f"标题已保存到: {title_file}")
+        # 缓存 save_titles_to_file 的结果
+        self._cached_title_file = save_titles_to_file(results, id_to_name, failed_ids)
+        print(f"标题已保存到: {self._cached_title_file}")
 
         return results, id_to_name, failed_ids
 
-    def _execute_mode_strategy(
-        self, mode_strategy: Dict, results: Dict, id_to_name: Dict, failed_ids: List
-    ) -> Optional[str]:
-        """执行模式特定逻辑"""
-        # 获取当前监控平台ID列表
-        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
 
+    # === 新的方法结构：数据准备 ===
+    def _prepare_analysis_data(self, results: Dict, id_to_name: Dict, failed_ids: List) -> Dict:
+        """准备分析所需的基础数据"""
+        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
         new_titles = detect_latest_new_titles(current_platform_ids)
-        time_info = Path(save_titles_to_file(results, id_to_name, failed_ids)).stem
+        time_info = Path(self._cached_title_file).stem
         word_groups, filter_words = load_frequency_words()
 
-        # current模式下，实时推送需要使用完整的历史数据来保证统计信息的完整性
+        return {
+            "current_platform_ids": current_platform_ids,
+            "new_titles": new_titles,
+            "time_info": time_info,
+            "word_groups": word_groups,
+            "filter_words": filter_words,
+            "results": results,
+            "id_to_name": id_to_name,
+            "failed_ids": failed_ids
+        }
+
+    def _load_current_and_historical_data(self, analysis_data: Dict) -> Dict:
+        """加载当前和历史数据"""
+        # 当前数据的标题信息
+        current_title_info = self._prepare_current_title_info(
+            analysis_data["results"],
+            analysis_data["time_info"]
+        )
+
+        # 历史数据（用于current模式）
+        historical_data = self._load_analysis_data()
+
+        return {
+            "current_title_info": current_title_info,
+            "historical_data": historical_data
+        }
+
+    def _prepare_analysis_data_from_history(self) -> Dict:
+        """从历史数据准备分析所需的基础数据（用于ENABLE_CRAWLER=false的情况）"""
+        current_platform_ids = [platform["id"] for platform in CONFIG["PLATFORMS"]]
+        new_titles = detect_latest_new_titles(current_platform_ids)
+        word_groups, filter_words = load_frequency_words()
+
+        # 加载历史数据作为"当前"数据
+        historical_data = self._load_analysis_data()
+        if not historical_data:
+            raise RuntimeError("无法加载历史数据进行分析")
+
+        all_results, id_to_name, title_info, historical_new_titles, _, _ = historical_data
+
+        return {
+            "current_platform_ids": current_platform_ids,
+            "new_titles": new_titles,
+            "time_info": "history",  # 标记为历史数据
+            "word_groups": word_groups,
+            "filter_words": filter_words,
+            "results": all_results,  # 使用历史数据作为results
+            "id_to_name": id_to_name,
+            "failed_ids": []  # 历史数据没有失败的ID
+        }
+
+    # === 新的方法结构：分析方法（按模式拆分） ===
+    def _analyze_current_mode(self, analysis_data: Dict, data_bundle: Dict) -> Tuple[List[Dict], str]:
+        """current模式分析：使用完整历史数据"""
+        historical_data = data_bundle["historical_data"]
+        if not historical_data:
+            raise RuntimeError("current模式需要历史数据，但无法加载历史数据")
+
+        all_results, historical_id_to_name, historical_title_info, historical_new_titles, _, _ = historical_data
+
+        print(f"current模式：使用过滤后的历史数据，包含平台：{list(all_results.keys())}")
+
+        stats, html_file = self._run_analysis_pipeline(
+            all_results,
+            self.report_mode,
+            historical_title_info,
+            historical_new_titles,
+            analysis_data["word_groups"],
+            analysis_data["filter_words"],
+            historical_id_to_name,
+            failed_ids=analysis_data["failed_ids"],
+        )
+
+        return stats, html_file
+
+    def _analyze_incremental_mode(self, analysis_data: Dict, data_bundle: Dict) -> Tuple[List[Dict], str]:
+        """incremental模式分析：使用当前数据"""
+        stats, html_file = self._run_analysis_pipeline(
+            analysis_data["results"],
+            self.report_mode,
+            data_bundle["current_title_info"],
+            analysis_data["new_titles"],
+            analysis_data["word_groups"],
+            analysis_data["filter_words"],
+            analysis_data["id_to_name"],
+            failed_ids=analysis_data["failed_ids"],
+        )
+
+        return stats, html_file
+
+    def _analyze_daily_mode(self, analysis_data: Dict, data_bundle: Dict) -> Tuple[List[Dict], str]:
+        """daily模式分析：使用当前数据"""
+        stats, html_file = self._run_analysis_pipeline(
+            analysis_data["results"],
+            self.report_mode,
+            data_bundle["current_title_info"],
+            analysis_data["new_titles"],
+            analysis_data["word_groups"],
+            analysis_data["filter_words"],
+            analysis_data["id_to_name"],
+            failed_ids=analysis_data["failed_ids"],
+        )
+
+        return stats, html_file
+
+    def _analyze_llm_mode(self, analysis_data: Dict, data_bundle: Dict) -> Tuple[List[Dict], str]:
+        """llm_analysis模式分析：使用当前数据"""
+        stats, html_file = self._run_analysis_pipeline(
+            analysis_data["results"],
+            self.report_mode,
+            data_bundle["current_title_info"],
+            analysis_data["new_titles"],
+            analysis_data["word_groups"],
+            analysis_data["filter_words"],
+            analysis_data["id_to_name"],
+            failed_ids=analysis_data["failed_ids"],
+        )
+
+        return stats, html_file
+
+    # === 新的方法结构：推送方法 ===
+    def _send_realtime_notification(self, stats: List[Dict], analysis_data: Dict, data_bundle: Dict,
+                                   html_file: str, mode_strategy: Dict) -> None:
+        """发送实时通知"""
+        if not mode_strategy["should_send_realtime"]:
+            return
+
+        # 根据模式选择合适的数据
         if self.report_mode == "current":
-            # 加载完整的历史数据（已按当前平台过滤）
-            analysis_data = self._load_analysis_data()
-            if analysis_data:
-                (
-                    all_results,
-                    historical_id_to_name,
-                    historical_title_info,
-                    historical_new_titles,
-                    _,
-                    _,
-                ) = analysis_data
+            historical_data = data_bundle["historical_data"]
+            if historical_data:
+                _, historical_id_to_name, _, historical_new_titles, _, _ = historical_data
+                combined_id_to_name = {**historical_id_to_name, **analysis_data["id_to_name"]}
 
-                print(
-                    f"current模式：使用过滤后的历史数据，包含平台：{list(all_results.keys())}"
-                )
-
-                stats, html_file = self._run_analysis_pipeline(
-                    all_results,
-                    self.report_mode,
-                    historical_title_info,
-                    historical_new_titles,
-                    word_groups,
-                    filter_words,
-                    historical_id_to_name,
-                    failed_ids=failed_ids,
-                )
-
-                combined_id_to_name = {**historical_id_to_name, **id_to_name}
-
-                print(f"HTML报告已生成: {html_file}")
-
-                # 发送实时通知（使用完整历史数据的统计结果）
-                summary_html = None
-                if mode_strategy["should_send_realtime"]:
-                    self._send_notification_if_needed(
-                        stats,
-                        mode_strategy["realtime_report_type"],
-                        self.report_mode,
-                        failed_ids=failed_ids,
-                        new_titles=historical_new_titles,
-                        id_to_name=combined_id_to_name,
-                        html_file_path=html_file,
-                    )
-            else:
-                print("❌ 严重错误：无法读取刚保存的数据文件")
-                raise RuntimeError("数据一致性检查失败：保存后立即读取失败")
-        else:
-            title_info = self._prepare_current_title_info(results, time_info)
-            stats, html_file = self._run_analysis_pipeline(
-                results,
-                self.report_mode,
-                title_info,
-                new_titles,
-                word_groups,
-                filter_words,
-                id_to_name,
-                failed_ids=failed_ids,
-            )
-            print(f"HTML报告已生成: {html_file}")
-
-            # 发送实时通知（如果需要）
-            summary_html = None
-            if mode_strategy["should_send_realtime"]:
                 self._send_notification_if_needed(
                     stats,
                     mode_strategy["realtime_report_type"],
                     self.report_mode,
-                    failed_ids=failed_ids,
-                    new_titles=new_titles,
-                    id_to_name=id_to_name,
+                    failed_ids=analysis_data["failed_ids"],
+                    new_titles=historical_new_titles,
+                    id_to_name=combined_id_to_name,
                     html_file_path=html_file,
                 )
+        else:
+            self._send_notification_if_needed(
+                stats,
+                mode_strategy["realtime_report_type"],
+                self.report_mode,
+                failed_ids=analysis_data["failed_ids"],
+                new_titles=analysis_data["new_titles"],
+                id_to_name=analysis_data["id_to_name"],
+                html_file_path=html_file,
+            )
 
-        # 生成汇总报告（如果需要）
-        summary_html = None
-        if mode_strategy["should_generate_summary"]:
-            if mode_strategy["should_send_realtime"]:
-                # 如果已经发送了实时通知，汇总只生成HTML不发送通知
-                summary_html = self._generate_summary_html(
-                    mode_strategy["summary_mode"]
-                )
-            else:
-                # daily模式：直接生成汇总报告并发送通知
-                summary_html = self._generate_summary_report(mode_strategy)
+    def _generate_and_send_summary(self, mode_strategy: Dict, should_send_realtime: bool) -> Optional[str]:
+        """生成汇总报告并发送通知"""
+        if not mode_strategy["should_generate_summary"]:
+            return None
 
-        # 打开浏览器（仅在非容器环境）
-        if self._should_open_browser() and html_file:
-            if summary_html:
-                summary_url = "file://" + str(Path(summary_html).resolve())
-                print(f"正在打开汇总报告: {summary_url}")
-                webbrowser.open(summary_url)
-            else:
-                file_url = "file://" + str(Path(html_file).resolve())
-                print(f"正在打开HTML报告: {file_url}")
-                webbrowser.open(file_url)
-        elif self.is_docker_container and html_file:
-            if summary_html:
-                print(f"汇总报告已生成（Docker环境）: {summary_html}")
-            else:
-                print(f"HTML报告已生成（Docker环境）: {html_file}")
+        if should_send_realtime:
+            # 如果已经发送了实时通知，汇总只生成HTML不发送通知
+            return self._generate_summary_html(mode_strategy["summary_mode"])
+        else:
+            # daily模式等：直接生成汇总报告并发送通知
+            return self._generate_summary_report(mode_strategy)
 
-        return summary_html
+    def _open_report_in_browser(self, html_file: str, summary_html: Optional[str]) -> None:
+        """在浏览器中打开报告"""
+        if not self._should_open_browser() or not html_file:
+            if self.is_docker_container and html_file:
+                if summary_html:
+                    print(f"汇总报告已生成（Docker环境）: {summary_html}")
+                else:
+                    print(f"HTML报告已生成（Docker环境）: {html_file}")
+            return
+
+        if summary_html:
+            summary_url = "file://" + str(Path(summary_html).resolve())
+            print(f"正在打开汇总报告: {summary_url}")
+            webbrowser.open(summary_url)
+        else:
+            file_url = "file://" + str(Path(html_file).resolve())
+            print(f"正在打开HTML报告: {file_url}")
+            webbrowser.open(file_url)
 
     def run(self) -> None:
         """执行分析流程"""
         try:
+            # 1. 初始化和配置读取
             self._initialize_and_check_config()
-
             mode_strategy = self._get_mode_strategy()
 
-            results, id_to_name, failed_ids = self._crawl_data()
+            # 2. 数据准备：根据是否启用爬虫选择数据源
+            if CONFIG["ENABLE_CRAWLER"]:
+                # 启用爬虫：爬取数据并输出到 output 目录
+                results, id_to_name, failed_ids = self._crawl_data()
 
-            self._execute_mode_strategy(mode_strategy, results, id_to_name, failed_ids)
+                # 检查是否仅执行爬取功能
+                if CONFIG["ONLY_CRAWLER"]:
+                    return
+
+                # 准备分析所需的数据
+                analysis_data = self._prepare_analysis_data(results, id_to_name, failed_ids)
+            else:
+                # 禁用爬虫：使用历史数据
+                analysis_data = self._prepare_analysis_data_from_history()
+
+            # 3. 读取当前和历史数据
+            data_bundle = self._load_current_and_historical_data(analysis_data)
+
+            # 4. 根据当前的模式策略，分别执行不同的分析逻辑
+            if self.report_mode == "current":
+                stats, html_file = self._analyze_current_mode(analysis_data, data_bundle)
+            elif self.report_mode == "incremental":
+                stats, html_file = self._analyze_incremental_mode(analysis_data, data_bundle)
+            elif self.report_mode == "daily":
+                stats, html_file = self._analyze_daily_mode(analysis_data, data_bundle)
+            elif self.report_mode == "llm_analysis":
+                stats, html_file = self._analyze_llm_mode(analysis_data, data_bundle)
+            else:
+                # 默认使用daily模式
+                stats, html_file = self._analyze_daily_mode(analysis_data, data_bundle)
+
+            print(f"HTML报告已生成: {html_file}")
+
+            # 5. 根据推送配置，推送最新的分析报告
+            # 发送实时通知
+            self._send_realtime_notification(stats, analysis_data, data_bundle, html_file, mode_strategy)
+
+            # 生成汇总报告并发送通知
+            summary_html = self._generate_and_send_summary(mode_strategy, mode_strategy["should_send_realtime"])
+
+            # 在浏览器中打开报告
+            self._open_report_in_browser(html_file, summary_html)
 
         except Exception as e:
             print(f"分析流程执行出错: {e}")

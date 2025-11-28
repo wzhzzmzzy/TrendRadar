@@ -17,6 +17,7 @@ class CrawlerConfig(BaseModel):
     """爬虫配置"""
     REQUEST_INTERVAL: int = Field(1000, description="请求间隔(毫秒)", ge=0)
     ENABLE_CRAWLER: bool = Field(True, description="是否启用爬取新闻功能")
+    ONLY_CRAWLER: bool = Field(False, description="是否仅执行爬取功能，禁用分析和推送")
     USE_PROXY: bool = Field(False, description="是否启用代理")
     DEFAULT_PROXY: str = Field("", description="默认代理地址")
 
@@ -111,6 +112,7 @@ class TrendRadarConfig(BaseModel):
     # 爬虫配置
     REQUEST_INTERVAL: int
     ENABLE_CRAWLER: bool
+    ONLY_CRAWLER: bool
     USE_PROXY: bool
     DEFAULT_PROXY: str
 
