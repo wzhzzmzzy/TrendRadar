@@ -1,5 +1,4 @@
-from pydantic import BaseModel, Field
-from typing import List, Union, Optional, Dict, Tuple
+from typing import List, Optional, Dict, Tuple
 from openai import OpenAI
 from utils import CONFIG
 from utils.formatter import format_time_display
@@ -7,22 +6,13 @@ from json_repair import repair_json
 from pathlib import Path
 from push.sender import generate_html_report
 from crawler.process import read_all_today_titles
+from models.llm_models import NewsGroup
 import os
 import re
 import json
 
 
 # === 大模型分析 ===
-# LLM 分析结果的数据模型
-class NewsTitle(BaseModel):
-    rank: Union[int, List[int]]  # 支持单个排名或排名列表
-    source: str
-
-
-class NewsGroup(BaseModel):
-    rank: int = Field(description="按照当前分组的新闻数量和热榜位置给出排名")
-    keywords: List[str] = Field(description="当前分组的新闻关键词，格式为字符串数组")
-    news_title: List[NewsTitle] = Field(description="当前分组的所有新闻标题")
 
 
 class LLMAnalyzer:

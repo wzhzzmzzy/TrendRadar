@@ -1,10 +1,12 @@
 import os
 from pathlib import Path
 import yaml
+from typing import Dict, List, Optional, Union, Any
+from models import TrendRadarConfig
 
 
 # === 配置管理 ===
-def load_config():
+def load_config() -> TrendRadarConfig:
     """加载配置文件"""
     config_path = os.environ.get("CONFIG_PATH", "config/config.yaml")
 
@@ -97,11 +99,11 @@ def load_config():
         },
         "PLATFORMS": config_data["platforms"],
         "LLM_KEY": os.environ.get("LLM_KEY", "").strip()
-        or config_data["llm"]["api_key"],
+        or config_data.get("llm", {}).get("api_key", ""),
         "LLM_URL": os.environ.get("LLM_URL", "").strip()
-        or config_data["llm"]["base_url"],
+        or config_data.get("llm", {}).get("base_url", ""),
         "LLM_MODEL": os.environ.get("LLM_MODEL", "").strip()
-        or config_data["llm"]["model"],
+        or config_data.get("llm", {}).get("model", ""),
     }
 
     # 通知渠道配置（环境变量优先）
@@ -196,7 +198,14 @@ def load_config():
     else:
         print("未配置任何通知渠道")
 
-    return config
+    # 使用 Pydantic 验证配置
+    try:
+        validated_config = TrendRadarConfig(**config)
+        print("配置验证成功")
+        return validated_config
+    except Exception as e:
+        print(f"配置验证失败: {e}")
+        raise ValueError(f"配置文件格式错误: {e}") from e
 
 
 # === SMTP邮件配置 ===
@@ -228,4 +237,43 @@ SMTP_CONFIGS = {
     "189.cn": {"server": "smtp.189.cn", "port": 465, "encryption": "SSL"},
     # 阿里云邮箱（使用 TLS）
     "aliyun.com": {"server": "smtp.aliyun.com", "port": 465, "encryption": "TLS"},
+}
+
+MODE_STRATEGIES_CONFIG = {
+    "incremental": {
+        "mode_name": "增量模式",
+        "description": "增量模式（只关注新增新闻，无新增时不推送）",
+        "realtime_report_type": "实时增量",
+        "summary_report_type": "当日汇总",
+        "should_send_realtime": True,
+        "should_generate_summary": True,
+        "summary_mode": "daily",
+    },
+    "current": {
+        "mode_name": "当前榜单模式",
+        "description": "当前榜单模式（当前榜单匹配新闻 + 新增新闻区域 + 按时推送）",
+        "realtime_report_type": "实时当前榜单",
+        "summary_report_type": "当前榜单汇总",
+        "should_send_realtime": True,
+        "should_generate_summary": True,
+        "summary_mode": "current",
+    },
+    "daily": {
+        "mode_name": "当日汇总模式",
+        "description": "当日汇总模式（所有匹配新闻 + 新增新闻区域 + 按时推送）",
+        "realtime_report_type": "",
+        "summary_report_type": "当日汇总",
+        "should_send_realtime": False,
+        "should_generate_summary": True,
+        "summary_mode": "daily",
+    },
+    "llm_analysis": {
+        "mode_name": "大模型汇总模式",
+        "description": "大模型汇总模式（总结所有匹配新闻 + 按时推送）",
+        "realtime_report_type": "",
+        "summary_report_type": "大模型总结",
+        "should_send_realtime": True,
+        "should_generate_summary": False,
+        "summary_mode": "llm_analysis",
+    },
 }

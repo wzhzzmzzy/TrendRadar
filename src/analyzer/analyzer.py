@@ -1,11 +1,12 @@
 from pathlib import Path
-from utils import CONFIG, VERSION, check_version_update, get_beijing_time, ensure_directory_exists
 import webbrowser
 import os
 from .llm import LLMAnalyzer
 from crawler.fetcher import DataFetcher
 from crawler.process import read_all_today_titles, load_frequency_words, detect_latest_new_titles, save_titles_to_file
 from push.sender import generate_html_report, send_to_notifications
+from utils import CONFIG, VERSION, check_version_update, get_beijing_time, ensure_directory_exists
+from utils.config import MODE_STRATEGIES_CONFIG
 from utils.statistics import count_word_frequency
 from typing import Dict, List, Tuple, Optional
 
@@ -14,56 +15,19 @@ class NewsAnalyzer:
     """新闻分析器"""
 
     # 模式策略定义
-    MODE_STRATEGIES = {
-        "incremental": {
-            "mode_name": "增量模式",
-            "description": "增量模式（只关注新增新闻，无新增时不推送）",
-            "realtime_report_type": "实时增量",
-            "summary_report_type": "当日汇总",
-            "should_send_realtime": True,
-            "should_generate_summary": True,
-            "summary_mode": "daily",
-        },
-        "current": {
-            "mode_name": "当前榜单模式",
-            "description": "当前榜单模式（当前榜单匹配新闻 + 新增新闻区域 + 按时推送）",
-            "realtime_report_type": "实时当前榜单",
-            "summary_report_type": "当前榜单汇总",
-            "should_send_realtime": True,
-            "should_generate_summary": True,
-            "summary_mode": "current",
-        },
-        "daily": {
-            "mode_name": "当日汇总模式",
-            "description": "当日汇总模式（所有匹配新闻 + 新增新闻区域 + 按时推送）",
-            "realtime_report_type": "",
-            "summary_report_type": "当日汇总",
-            "should_send_realtime": False,
-            "should_generate_summary": True,
-            "summary_mode": "daily",
-        },
-        "llm_analysis": {
-            "mode_name": "大模型汇总模式",
-            "description": "大模型汇总模式（总结所有匹配新闻 + 按时推送）",
-            "realtime_report_type": "",
-            "summary_report_type": "大模型总结",
-            "should_send_realtime": True,
-            "should_generate_summary": False,
-            "summary_mode": "llm_analysis",
-        },
-    }
+    MODE_STRATEGIES = MODE_STRATEGIES_CONFIG
 
     def __init__(self):
-        self.request_interval = CONFIG["REQUEST_INTERVAL"]
-        self.report_mode = CONFIG["REPORT_MODE"]
-        self.rank_threshold = CONFIG["RANK_THRESHOLD"]
+        self.request_interval = CONFIG.REQUEST_INTERVAL
+        self.report_mode = CONFIG.REPORT_MODE
+        self.rank_threshold = CONFIG.RANK_THRESHOLD
         self.is_github_actions = os.environ.get("GITHUB_ACTIONS") == "true"
         self.is_docker_container = self._detect_docker_environment()
         self.update_info = None
-        self.proxy_url = None
+        self.proxy_url: str | None = None
         self._setup_proxy()
         self.data_fetcher = DataFetcher(self.proxy_url)
-        self.llm_analyzer = LLMAnalyzer() if CONFIG["LLM_KEY"] else None
+        self.llm_analyzer = LLMAnalyzer() if CONFIG.LLM_KEY else None
 
         if self.is_github_actions:
             self._check_version_update()
@@ -87,10 +51,10 @@ class NewsAnalyzer:
 
     def _setup_proxy(self) -> None:
         """设置代理配置"""
-        if not self.is_github_actions and CONFIG["USE_PROXY"]:
-            self.proxy_url = CONFIG["DEFAULT_PROXY"]
+        if not self.is_github_actions and CONFIG.USE_PROXY:
+            self.proxy_url = CONFIG.DEFAULT_PROXY
             print("本地环境，使用代理")
-        elif not self.is_github_actions and not CONFIG["USE_PROXY"]:
+        elif not self.is_github_actions and not CONFIG.USE_PROXY:
             print("本地环境，未启用代理")
         else:
             print("GitHub Actions环境，不使用代理")
@@ -99,7 +63,7 @@ class NewsAnalyzer:
         """检查版本更新"""
         try:
             need_update, remote_version = check_version_update(
-                VERSION, CONFIG["VERSION_CHECK_URL"], self.proxy_url
+                VERSION, CONFIG.VERSION_CHECK_URL, self.proxy_url
             )
 
             if need_update and remote_version:
