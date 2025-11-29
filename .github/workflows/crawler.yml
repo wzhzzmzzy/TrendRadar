@@ -1,7 +1,7 @@
 name: Hot News Crawler
 on:
   schedule:
-    - cron: "0 10,18,21 * * *"
+    - cron: "0 2,9,13 * * *"
   workflow_dispatch:
 
 concurrency:
@@ -69,7 +69,7 @@ jobs:
           LLM_URL: ${{ secrets.LLM_URL }}
           LLM_MODEL: ${{ secrets.LLM_MODEL }}
           GITHUB_ACTIONS: true
-        run: python main.py
+        run: python src/app.py
         
       - name: Commit and push if changes
         run: |

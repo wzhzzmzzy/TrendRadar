@@ -124,5 +124,3 @@ platforms:
 llm: 
   base_url: "https://api.deepseek.com"
   model: "deepseek-chat"
-  api_key: "sk-ded4cb240b6f4ba0aa4200308f298695"
-
