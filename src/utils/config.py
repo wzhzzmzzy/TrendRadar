@@ -274,7 +274,7 @@ MODE_STRATEGIES_CONFIG = {
     "llm_analysis": {
         "mode_name": "大模型汇总模式",
         "description": "大模型汇总模式（总结所有匹配新闻 + 按时推送）",
-        "realtime_report_type": "",
+        "realtime_report_type": "AI 分组",
         "summary_report_type": "大模型总结",
         "should_send_realtime": True,
         "should_generate_summary": False,
